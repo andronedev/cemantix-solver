@@ -4,6 +4,7 @@ mod game;
 mod model;
 
 use anyhow::{Context, Result};
+use cemantix_core::{SCALE_CEMANTIX, SCALE_QUELMOT};
 use clap::{Parser, Subcommand};
 use events::Event;
 use game::{LocalOracle, Oracle, play_game, print_event};
@@ -51,6 +52,9 @@ enum Cmd {
         /// Secrets are drawn among plausible words with frequency rank below this
         #[arg(long, default_value_t = 30000)]
         prior: usize,
+        /// Score rounding of the simulated game: cemantix (4 decimals) or quelmot (integer /1000)
+        #[arg(long, default_value = "cemantix")]
+        game: String,
         #[arg(short, long)]
         verbose: bool,
     },
@@ -103,8 +107,9 @@ fn main() -> Result<()> {
             n,
             seed,
             prior,
+            game,
             verbose,
-        } => sim(&cli.data, n, seed, prior, verbose),
+        } => sim(&cli.data, n, seed, prior, &game, verbose),
         Cmd::Play {
             day,
             dry_run,
@@ -155,7 +160,12 @@ fn verify(data: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sim(data: &Path, n: usize, seed: u64, prior: usize, verbose: bool) -> Result<()> {
+fn sim(data: &Path, n: usize, seed: u64, prior: usize, game: &str, verbose: bool) -> Result<()> {
+    let scale = match game {
+        "cemantix" => SCALE_CEMANTIX,
+        "quelmot" => SCALE_QUELMOT,
+        other => anyhow::bail!("jeu inconnu « {other} » (cemantix ou quelmot)"),
+    };
     let model = model::load(data)?;
     let pool: Vec<u32> = model
         .plausible_indices()
@@ -163,7 +173,7 @@ fn sim(data: &Path, n: usize, seed: u64, prior: usize, verbose: bool) -> Result<
         .filter(|&i| (i as usize) < prior)
         .collect();
     println!(
-        "{} parties, secrets tirés parmi {} mots (rang < {prior})",
+        "{} parties ({game}, scores arrondis à 1/{scale}), secrets tirés parmi {} mots (rang < {prior})",
         n,
         pool.len()
     );
@@ -177,13 +187,13 @@ fn sim(data: &Path, n: usize, seed: u64, prior: usize, verbose: bool) -> Result<
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let secret = pool[((rng >> 33) as usize) % pool.len()];
-        let mut oracle = LocalOracle::new(&model, secret);
+        let mut oracle = LocalOracle::new(&model, secret, scale);
         let mut emit = |ev: &Event| {
             if verbose {
                 print_event(ev);
             }
         };
-        let res = play_game(&model, &mut oracle, &[], &mut emit)?;
+        let res = play_game(&model, &mut oracle, scale, &[], &mut emit)?;
         hist[(res.guesses as usize).min(63)] += 1;
         total_ms += res.total_ms;
         if res.guesses >= 6 {
@@ -253,7 +263,7 @@ fn play(
             (
                 None,
                 format!("hors ligne · secret « {w} »"),
-                Box::new(LocalOracle::new(&model, idx)),
+                Box::new(LocalOracle::new(&model, idx, SCALE_CEMANTIX)),
             )
         }
         None => {
@@ -310,5 +320,5 @@ fn play(
     }
 
     let mut emit = |ev: &Event| print_event(ev);
-    play_game(&model, oracle.as_mut(), &forced, &mut emit).map(|_| ())
+    play_game(&model, oracle.as_mut(), SCALE_CEMANTIX, &forced, &mut emit).map(|_| ())
 }

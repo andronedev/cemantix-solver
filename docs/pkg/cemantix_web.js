@@ -58,21 +58,24 @@ export class Engine {
     }
     /**
      * `f16` = little-endian half-precision rows, `words` = one word per line,
-     * `opener` = precomputed first guess, `tol_level` = starting tolerance index.
+     * `opener` = precomputed first guess, `model_error` = max score error of the
+     * compressed model (from meta.json), `scale` = the game's score rounding
+     * (10 000 for Cémantix, 1 000 for QuelMot).
      * @param {Uint8Array} f16
      * @param {string} words
      * @param {number} dim
      * @param {string | null | undefined} opener
-     * @param {number} tol_level
+     * @param {number} model_error
+     * @param {number | null} [scale]
      */
-    constructor(f16, words, dim, opener, tol_level) {
+    constructor(f16, words, dim, opener, model_error, scale) {
         const ptr0 = passArray8ToWasm0(f16, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(words, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
         var ptr2 = isLikeNone(opener) ? 0 : passStringToWasm0(opener, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         var len2 = WASM_VECTOR_LEN;
-        const ret = wasm.engine_new(ptr0, len0, ptr1, len1, dim, ptr2, len2, tol_level);
+        const ret = wasm.engine_new(ptr0, len0, ptr1, len1, dim, ptr2, len2, model_error, !isLikeNone(scale), isLikeNone(scale) ? 0 : scale);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -119,8 +122,32 @@ export class Engine {
         const ret = wasm.engine_plausible(this.__wbg_ptr);
         return ret >>> 0;
     }
+    /**
+     * Start a new game with the current scale.
+     */
     reset() {
         wasm.engine_reset(this.__wbg_ptr);
+    }
+    /**
+     * @returns {number}
+     */
+    scale() {
+        const ret = wasm.engine_scale(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Switch game (score rounding scale) and start a new game.
+     * @param {number} scale
+     */
+    set_scale(scale) {
+        wasm.engine_set_scale(this.__wbg_ptr, scale);
+    }
+    /**
+     * @returns {number}
+     */
+    tol() {
+        const ret = wasm.engine_tol(this.__wbg_ptr);
+        return ret;
     }
     /**
      * @param {number} k

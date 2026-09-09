@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Cémantix assistant</title>
+<title>Assistant sémantique</title>
 <style>
 :root{--fg:#1a1a1a;--muted:#6b6b6b;--line:#e2e2e2;--accent:#1f4fbf;--bg:#fff}
 *{box-sizing:border-box}
@@ -15,6 +15,9 @@ h1{font-size:20px;font-weight:600;margin:0 0 4px}
 .small{font-size:14px}
 section{margin-top:36px}
 hr{border:0;border-top:1px solid var(--line);margin:32px 0}
+.games{display:flex;gap:16px;margin-top:20px;font-size:14px}
+.games button{background:none;border:0;padding:0 0 3px;color:var(--muted);border-bottom:2px solid transparent;border-radius:0}
+.games button[aria-pressed="true"]{color:var(--fg);border-bottom-color:var(--fg)}
 .turn{font-size:14px;color:var(--muted)}
 .prop{font-size:28px;font-weight:600;margin:2px 0 4px;letter-spacing:-.01em}
 form{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
@@ -52,8 +55,12 @@ footer a{color:var(--muted)}
 </head>
 <body>
 <main>
-  <h1>Cémantix assistant</h1>
+  <h1>Assistant sémantique</h1>
   <div class="muted small" id="sub">Chargement…</div>
+  <div class="games" id="games" hidden>
+    <button type="button" data-game="cemantix" aria-pressed="true">Cémantix</button>
+    <button type="button" data-game="quelmot" aria-pressed="false">QuelMot</button>
+  </div>
 
   <section id="loading">
     <div class="small" id="loadmsg">Chargement du solveur</div>
@@ -67,7 +74,7 @@ footer a{color:var(--muted)}
     <div class="muted small" id="propinfo"></div>
     <form id="playform" autocomplete="off">
       <input id="word" placeholder="mot joué" spellcheck="false" aria-label="mot joué">
-      <input id="temp" placeholder="°C" inputmode="decimal" aria-label="température en °C">
+      <input id="temp" placeholder="°C" inputmode="decimal" aria-label="score renvoyé par le jeu">
       <input id="perm" placeholder="‰" inputmode="numeric" aria-label="rang ‰ (optionnel)" title="rang ‰ affiché par le site, optionnel">
       <button class="primary" id="ok" type="submit">Valider</button>
     </form>
@@ -85,14 +92,15 @@ footer a{color:var(--muted)}
 
   <section id="hist" hidden>
     <table>
-      <thead><tr><th>#</th><th>mot</th><th class="num">°C</th><th></th><th class="num">‰</th><th class="num">restants</th></tr></thead>
+      <thead><tr><th>#</th><th>mot</th><th class="num" id="scorehead">°C</th><th></th><th class="num">‰</th><th class="num">restants</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </section>
 
   <footer>
-    Jouez sur cemantix.certitudes.org et reportez ici le °C obtenu. Chaque score est une contrainte exacte sur le mot
-    secret ; la page garde les mots compatibles et propose le plus informatif. Tout s'exécute dans le navigateur.
+    <span id="foothint">Jouez sur cemantix.certitudes.org et reportez ici le °C obtenu.</span>
+    Chaque score est une contrainte exacte sur le mot secret ; la page garde les mots compatibles et propose
+    le plus informatif. Tout s'exécute dans le navigateur.
     <a href="https://github.com/andronedev/cemantix-solver">Code source</a>.
   </footer>
 </main>
@@ -102,8 +110,29 @@ import init, { Engine } from './pkg/cemantix_web.js';
 
 const $ = id => document.getElementById(id);
 const fmtN = n => n.toLocaleString('fr-FR');
-const fmtC = s => (s * 100).toFixed(2).replace('.', ',');
 const fmtB = b => b.toFixed(1).replace('.', ',');
+
+// Each game rounds the cosine differently; the solver is told the scale.
+const GAMES = {
+  cemantix: {
+    name: 'Cémantix', site: 'cemantix.certitudes.org', scale: 10000,
+    placeholder: '°C', head: '°C', example: '8,89', min: -100, max: 100,
+    parse: t => Math.round(t * 100) / 10000,
+    fmt: s => (s * 100).toFixed(2).replace('.', ','),
+    won: (s, p) => s >= 0.9999 || p === 1000,
+    hint: 'Jouez sur cemantix.certitudes.org et reportez ici le °C obtenu.',
+  },
+  quelmot: {
+    name: 'QuelMot', site: 'quelmot.fr', scale: 1000,
+    placeholder: 'score', head: 'score', example: '89', min: -1000, max: 1000,
+    parse: t => Math.round(t) / 1000,
+    fmt: s => String(Math.round(s * 1000)),
+    won: (s, p) => Math.round(s * 1000) >= 1000 || p === 1000,
+    hint: 'Jouez sur quelmot.fr et reportez ici le score obtenu (entier entre -1000 et 1000).',
+  },
+};
+let game = GAMES.cemantix;
+const fmtC = s => game.fmt(s);
 function emoji(s, p) {
   if (p === 1000) return '🥳';
   if (p != null) return p >= 999 ? '😱' : p >= 990 ? '🔥' : p >= 900 ? '🥵' : '😎';
@@ -165,7 +194,7 @@ function renderHistory() {
     if (g.unknown) tr.className = 'unknown';
     if (g.win) tr.className = 'win';
     const cells = g.unknown ? [g.n, g.word, '', 'inconnu', '', '']
-      : g.win ? [g.n, g.word, '100,00', '🥳', '1000', '1']
+      : g.win ? [g.n, g.word, fmtC(1), '🥳', '1000', '1']
       : [g.n, g.word, fmtC(g.score), emoji(g.score, g.p), g.p ?? '', fmtN(g.after)];
     cells.forEach((c, i) => {
       const td = document.createElement('td');
@@ -184,9 +213,8 @@ function propose() {
   const p = st.proposal;
   $('turn').textContent = `Coup ${st.n}`;
   $('prop').textContent = p.word;
-  $('propinfo').textContent = p.opener ? `Premier mot précalculé : environ 12,5 bits d'information attendus.`
-    : p.candidates === 1 ? `Dernier candidat compatible avec tous vos scores.`
-    : `${fmtB(p.entropy)} bits attendus, ${fmtN(p.buckets)} réponses possibles parmi ${fmtN(p.candidates)} candidats.`;
+  $('propinfo').textContent = p.candidates === 1 ? `Dernier candidat compatible avec tous vos scores.`
+    : `${p.opener ? 'Premier mot précalculé : ' : ''}${fmtB(p.entropy)} bits attendus, ${fmtN(p.buckets)} réponses possibles parmi ${fmtN(p.candidates)} candidats.`;
   $('word').value = p.word; $('temp').value = ''; $('perm').value = '';
   $('temp').focus();
 }
@@ -214,7 +242,7 @@ function onWordInput() {
     const idx = engine.lookup(w);
     if (idx == null) { setMsg(`« ${w} » est absent du modèle. Le site n'accepte que les singuliers et les infinitifs.`, 'err'); return; }
     const ev = JSON.parse(engine.evaluate(idx));
-    const ref = st.proposal.opener ? '12,5' : fmtB(st.proposal.entropy);
+    const ref = fmtB(st.proposal.entropy);
     setMsg(`« ${w} » : ${fmtB(ev.entropy)} bits attendus${ev.candidate ? '' : ', et ce n’est pas un candidat'} ; la proposition en apporte ${ref}.`);
   }, 200);
 }
@@ -225,10 +253,10 @@ function validate() {
   const w = $('word').value.trim().toLowerCase();
   if (idx == null) { setMsg(`« ${w} » est absent du modèle.`, 'err'); return; }
   const t = parseTemp($('temp').value);
-  if (isNaN(t) || t < -100 || t > 100) { setMsg('Indiquez le °C affiché par le site, par exemple 8,89.', 'err'); $('temp').focus(); return; }
+  if (isNaN(t) || t < game.min || t > game.max) { setMsg(`Indiquez le ${game.placeholder} affiché par ${game.site}, par exemple ${game.example}.`, 'err'); $('temp').focus(); return; }
   const p = $('perm').value.trim() ? parseInt($('perm').value, 10) : null;
-  const score = Math.round(t * 100) / 10000;
-  if (score >= 0.9999 || p === 1000) { win(w); return; }
+  const score = game.parse(t);
+  if (game.won(score, p)) { win(w); return; }
   const res = JSON.parse(engine.observe(idx, score));
   st.history.push({ n: st.n, word: w, score, p, after: res.after, you: w !== st.proposal.word });
   st.n++;
@@ -263,6 +291,16 @@ function win(w) {
   for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found']) $(id).disabled = true;
 }
 
+function setGame(key, first) {
+  game = GAMES[key] || GAMES.cemantix;
+  for (const b of document.querySelectorAll('#games button')) b.setAttribute('aria-pressed', String(b.dataset.game === key));
+  $('temp').placeholder = game.placeholder;
+  $('scorehead').textContent = game.head;
+  $('foothint').textContent = game.hint;
+  try { localStorage.setItem('assistant-game', key); } catch (_) {}
+  if (!first) { engine.set_scale(game.scale); reset(); }
+}
+
 function reset() {
   engine.reset();
   st.n = 1; st.history = []; st.solved = null;
@@ -275,6 +313,7 @@ $('playform').addEventListener('submit', e => { e.preventDefault(); validate(); 
 $('unknown').onclick = unknown;
 $('found').onclick = () => { if (st.solved) return; const w = $('word').value.trim().toLowerCase(); if (currentIdx() != null) win(w); else setMsg(`« ${w} » est absent du modèle.`, 'err'); };
 $('reset').onclick = reset;
+for (const b of document.querySelectorAll('#games button')) b.onclick = () => { if (!engine || b.getAttribute('aria-pressed') === 'true') return; setGame(b.dataset.game, false); };
 $('word').addEventListener('input', onWordInput);
 
 (async () => {
@@ -290,11 +329,15 @@ $('word').addEventListener('input', onWordInput);
     }));
     $('loadbar').style.width = '100%'; $('loadmsg').textContent = 'Décodage des vecteurs';
     await new Promise(r => setTimeout(r, 30));
-    engine = new Engine(f16, words, meta.dim, meta.opener ?? undefined, meta.tol_level ?? 0);
+    let key = 'cemantix';
+    try { key = localStorage.getItem('assistant-game') || key; } catch (_) {}
+    if (!GAMES[key]) key = 'cemantix';
+    setGame(key, true);
+    engine = new Engine(f16, words, meta.dim, meta.opener ?? undefined, meta.f16_max_score_error ?? 0, GAMES[key].scale);
     N = engine.n();
     $('sub').textContent = `${fmtN(N)} mots, ${meta.dim} dimensions, modèle ${meta.model}.`;
     $('loading').hidden = true;
-    for (const id of ['play', 'cands']) $(id).hidden = false;
+    for (const id of ['play', 'cands', 'games']) $(id).hidden = false;
     renderCands(); propose();
   } catch (e) {
     $('loadmsg').textContent = 'Erreur : ' + (e && e.message ? e.message : e);

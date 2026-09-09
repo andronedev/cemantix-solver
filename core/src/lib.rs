@@ -10,8 +10,23 @@ use rayon::prelude::*;
 pub const PRIOR_RANK: usize = 50_000;
 pub const MAX_PROBES: usize = 2000;
 pub const MAX_TARGETS: usize = 4000;
-/// Tolerance ladder on |cos − score| (scores are rounded to 4 decimals).
-pub const TOLS: [f64; 5] = [1e-4, 2e-4, 5e-4, 1e-3, 3e-3];
+/// Tolerance ladder on |cos − score|, in units of the game's rounding step
+/// (Cémantix rounds the cosine to 1e-4, QuelMot to 1e-3).
+pub const TOL_MULT: [f64; 5] = [1.0, 2.0, 5.0, 10.0, 30.0];
+/// Cémantix: score = round(cos × 10 000) / 10 000.
+pub const SCALE_CEMANTIX: f64 = 10_000.0;
+/// QuelMot: score = round(cos × 1 000), an integer between -1000 and 1000.
+pub const SCALE_QUELMOT: f64 = 1_000.0;
+
+/// Smallest tolerance level whose tolerance covers half a rounding step plus the
+/// model's own score error (e.g. the float16 compression error).
+pub fn tol_level_for(scale: f64, model_error: f64) -> usize {
+    let needed = 0.5 + model_error * scale;
+    TOL_MULT
+        .iter()
+        .position(|&m| m >= needed)
+        .unwrap_or(TOL_MULT.len() - 1)
+}
 
 /// SIMD-friendly dot product (8 independent accumulators + scalar tail).
 #[inline]
@@ -35,6 +50,12 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn round4(x: f64) -> f64 {
     (x * 10000.0).round() / 10000.0
+}
+
+/// Round a cosine the way a game does (`scale` = 10 000 for Cémantix, 1 000 for QuelMot).
+#[inline]
+pub fn round_scale(x: f64, scale: f64) -> f64 {
+    (x * scale).round() / scale
 }
 
 pub fn is_plausible_word(w: &str) -> bool {
@@ -123,14 +144,21 @@ pub mod f16 {
     }
 }
 
-/// Entropy (bits) of the rounded-score partition induced by probe `p` over `targets`.
-pub fn partition_entropy(vecs: &[f32], dim: usize, p: usize, targets: &[u32]) -> (f64, usize) {
+/// Entropy (bits) of the rounded-score partition induced by probe `p` over `targets`,
+/// with scores rounded at `scale`.
+pub fn partition_entropy(
+    vecs: &[f32],
+    dim: usize,
+    p: usize,
+    targets: &[u32],
+    scale: f64,
+) -> (f64, usize) {
     let q = &vecs[p * dim..(p + 1) * dim];
     let mut keys: Vec<i32> = targets
         .iter()
         .map(|&t| {
             let t = t as usize;
-            (dot(&vecs[t * dim..(t + 1) * dim], q) as f64 * 10000.0).round() as i32
+            (dot(&vecs[t * dim..(t + 1) * dim], q) as f64 * scale).round() as i32
         })
         .collect();
     keys.sort_unstable();
@@ -284,6 +312,8 @@ pub struct Solver<'a> {
     pub alive: Vec<bool>,
     pub banned: Vec<bool>,
     pub restricted: bool,
+    /// Score rounding scale of the game (see `SCALE_CEMANTIX`, `SCALE_QUELMOT`).
+    pub scale: f64,
     pub tol_level: usize,
     pub obs: Vec<Observation>,
     pub alive_count: usize,
@@ -291,7 +321,12 @@ pub struct Solver<'a> {
 }
 
 impl<'a> Solver<'a> {
+    /// Solver for Cémantix scoring (4 decimals).
     pub fn new(vectors: &'a Vectors) -> Self {
+        Self::with_scale(vectors, SCALE_CEMANTIX)
+    }
+
+    pub fn with_scale(vectors: &'a Vectors, scale: f64) -> Self {
         let n = vectors.n();
         let alive = vectors.plausible.clone();
         let alive_count = alive.iter().filter(|&&a| a).count();
@@ -300,6 +335,7 @@ impl<'a> Solver<'a> {
             alive,
             banned: vec![false; n],
             restricted: true,
+            scale,
             tol_level: 0,
             obs: Vec::new(),
             alive_count,
@@ -308,7 +344,7 @@ impl<'a> Solver<'a> {
     }
 
     pub fn tol(&self) -> f64 {
-        TOLS[self.tol_level]
+        TOL_MULT[self.tol_level] / self.scale
     }
 
     pub fn ban(&mut self, idx: u32) {
@@ -370,7 +406,7 @@ impl<'a> Solver<'a> {
             relaxed = true;
             self.rebuild();
         }
-        while self.alive_count == 0 && self.tol_level + 1 < TOLS.len() {
+        while self.alive_count == 0 && self.tol_level + 1 < TOL_MULT.len() {
             self.tol_level += 1;
             relaxed = true;
             self.rebuild();
@@ -413,7 +449,13 @@ impl<'a> Solver<'a> {
     /// Expected information of playing `idx` now (entropy over the remaining candidates).
     pub fn evaluate(&self, idx: u32) -> (f64, usize) {
         let cands = self.candidates();
-        partition_entropy(&self.vectors.vecs, self.vectors.dim, idx as usize, &cands)
+        partition_entropy(
+            &self.vectors.vecs,
+            self.vectors.dim,
+            idx as usize,
+            &cands,
+            self.scale,
+        )
     }
 
     /// Pick the guess that maximises the expected information (entropy of the
@@ -457,8 +499,9 @@ impl<'a> Solver<'a> {
         let targets = Self::stride_sample(&cands, MAX_TARGETS);
         let vecs = &self.vectors.vecs;
         let dim = self.vectors.dim;
+        let scale = self.scale;
         let eval = |p: &u32| {
-            let (h, b) = partition_entropy(vecs, dim, *p as usize, &targets);
+            let (h, b) = partition_entropy(vecs, dim, *p as usize, &targets, scale);
             (h, b, *p)
         };
         // higher entropy wins; ties go to the more frequent word (lower index)

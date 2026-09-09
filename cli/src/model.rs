@@ -1,7 +1,9 @@
 //! Model download, parsing, caching and web export (CLI side, uses rayon).
 
 use anyhow::{Context, Result, bail};
-use cemantix_core::{PRIOR_RANK, Vectors, dot, f16, is_plausible_word, partition_entropy};
+use cemantix_core::{
+    PRIOR_RANK, SCALE_CEMANTIX, Vectors, dot, f16, is_plausible_word, partition_entropy,
+};
 use rayon::prelude::*;
 use std::fs;
 use std::io::{Read, Write};
@@ -18,6 +20,9 @@ const OPENER_PROBES: usize = 3000;
 
 pub fn load(data: &Path) -> Result<Model> {
     let t = Instant::now();
+    if !data.join("vecs.f32").exists() && data.join("model.f16").exists() {
+        return load_f16(data, t);
+    }
     let words: Vec<String> = fs::read_to_string(data.join("words.txt"))
         .with_context(|| format!("missing {}/words.txt (run fetch-model)", data.display()))?
         .lines()
@@ -56,6 +61,34 @@ pub fn load(data: &Path) -> Result<Model> {
             .opener
             .map(|i| model.words[i as usize].as_str())
             .unwrap_or("none")
+    );
+    Ok(model)
+}
+
+/// Load the compact web export (plausible words only, float16) when the full
+/// cache is absent: enough for `sim` and `play --dry-run`.
+fn load_f16(data: &Path, t: Instant) -> Result<Model> {
+    let words: Vec<String> = fs::read_to_string(data.join("words.txt"))?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let bytes = fs::read(data.join("model.f16"))?;
+    let meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(data.join("meta.json"))?)?;
+    let dim = meta["dim"].as_u64().context("meta.json: dim")? as usize;
+    if bytes.len() != words.len() * dim * 2 {
+        bail!("model.f16 size mismatch");
+    }
+    let name = format!("{} (float16)", meta["model"].as_str().unwrap_or("?"));
+    let n = words.len();
+    let mut model = Vectors::from_f16(name, dim, words, &bytes, PRIOR_RANK);
+    model.opener = meta["opener"].as_str().and_then(|w| model.lookup(w));
+    eprintln!(
+        "model {}: {} words x {} dims loaded in {:.0} ms",
+        model.name,
+        n,
+        dim,
+        t.elapsed().as_secs_f64() * 1000.0
     );
     Ok(model)
 }
@@ -207,7 +240,7 @@ pub fn build(data: &Path, name: &str, force: bool) -> Result<()> {
     let mut scored: Vec<(f64, usize, u32)> = probes
         .par_iter()
         .map(|&p| {
-            let (h, b) = partition_entropy(&vecs, dim, p as usize, &plausible);
+            let (h, b) = partition_entropy(&vecs, dim, p as usize, &plausible, SCALE_CEMANTIX);
             (h, b, p)
         })
         .collect();

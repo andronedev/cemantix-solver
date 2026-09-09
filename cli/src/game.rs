@@ -4,7 +4,7 @@ use crate::api::ScoreResp;
 use crate::events::{Event, emoji};
 use crate::model::Model;
 use anyhow::{Result, bail};
-use cemantix_core::{Choice, Observation, Solver, partition_entropy, round4};
+use cemantix_core::{Choice, Observation, Solver, partition_entropy, round_scale};
 use std::time::Instant;
 
 pub trait Oracle {
@@ -14,18 +14,20 @@ pub trait Oracle {
 /// Offline oracle reproducing the server's scoring from the local model.
 pub struct LocalOracle {
     pub secret: u32,
+    pub scale: f64,
     sims: Vec<f32>,
     thresh: f32,
 }
 
 impl LocalOracle {
-    pub fn new(model: &Model, secret: u32) -> Self {
+    pub fn new(model: &Model, secret: u32, scale: f64) -> Self {
         let sims = model.dots(secret as usize);
         let mut sorted = sims.clone();
         sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
         let thresh = sorted[1000.min(sorted.len() - 1)];
         LocalOracle {
             secret,
+            scale,
             sims,
             thresh,
         }
@@ -50,7 +52,7 @@ impl Oracle for LocalOracle {
             None
         };
         Ok(ScoreResp::Score {
-            s: round4(s as f64),
+            s: round_scale(s as f64, self.scale),
             p,
             solvers: None,
         })
@@ -162,10 +164,11 @@ pub fn print_event(ev: &Event) {
 pub fn play_game(
     model: &Model,
     oracle: &mut dyn Oracle,
+    scale: f64,
     forced: &[u32],
     emit: &mut dyn FnMut(&Event),
 ) -> Result<GameResult> {
-    let mut solver = Solver::new(model);
+    let mut solver = Solver::with_scale(model, scale);
     let start = Instant::now();
     let mut n: u32 = 0;
     let mut unknown_streak = 0;
@@ -179,7 +182,7 @@ pub fn play_game(
             Some(idx) => {
                 let cands = solver.candidates();
                 let (entropy, buckets) =
-                    partition_entropy(&model.vecs, model.dim, idx as usize, &cands);
+                    partition_entropy(&model.vecs, model.dim, idx as usize, &cands, scale);
                 (
                     Choice {
                         idx,
