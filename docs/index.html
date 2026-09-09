@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cémantix assistant</title>
+<style>
+:root{--fg:#1a1a1a;--muted:#6b6b6b;--line:#e2e2e2;--accent:#1f4fbf;--bg:#fff}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif}
+main{max-width:600px;margin:0 auto;padding:48px 20px 64px}
+h1{font-size:20px;font-weight:600;margin:0 0 4px}
+.muted{color:var(--muted)}
+.small{font-size:14px}
+section{margin-top:36px}
+hr{border:0;border-top:1px solid var(--line);margin:32px 0}
+.turn{font-size:14px;color:var(--muted)}
+.prop{font-size:28px;font-weight:600;margin:2px 0 4px;letter-spacing:-.01em}
+form{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+input{font:inherit;color:inherit;background:#fff;border:1px solid #c8c8c8;border-radius:4px;padding:8px 10px;min-width:0}
+input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(31,79,191,.15)}
+#word{flex:2 1 150px}
+#temp{flex:1 1 100px;font-variant-numeric:tabular-nums}
+#perm{flex:0 1 70px;font-variant-numeric:tabular-nums}
+button{font:inherit;cursor:pointer;border-radius:4px}
+button.primary{background:var(--accent);color:#fff;border:1px solid var(--accent);padding:8px 16px}
+button.primary:disabled{opacity:.4;cursor:default}
+button.link{background:none;border:0;padding:0;color:var(--accent);text-decoration:underline;text-underline-offset:3px;font-size:14px}
+button.link:disabled{color:var(--muted);text-decoration:none;cursor:default}
+.actions{display:flex;gap:18px;margin-top:12px;align-items:baseline}
+#msg{margin-top:12px;font-size:14px;min-height:1.5em}
+#msg.err{color:#b3261e}
+#msg.win{color:var(--fg);font-weight:600;font-size:16px}
+.cands{font-size:14px;line-height:1.7}
+.cands b{font-weight:600}
+.cands a{color:var(--fg);text-decoration:none;border-bottom:1px solid var(--line);cursor:pointer}
+.cands a:hover{border-color:var(--fg)}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:15px}
+th,td{padding:7px 8px 7px 0;text-align:left;border-bottom:1px solid var(--line)}
+th{font-weight:500;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.num{text-align:right;padding-right:0}
+td:nth-child(4){padding-left:10px}
+td.you{color:var(--muted)}
+tr.unknown td{color:var(--muted);text-decoration:line-through}
+tr.win td{font-weight:600}
+.progress{height:2px;background:var(--line);margin-top:10px}
+.progress i{display:block;height:100%;background:var(--accent);transition:width .3s}
+footer{margin-top:56px;font-size:13px;color:var(--muted)}
+footer a{color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Cémantix assistant</h1>
+  <div class="muted small" id="sub">Chargement…</div>
+
+  <section id="loading">
+    <div class="small" id="loadmsg">Chargement du solveur</div>
+    <div class="progress"><i id="loadbar" style="width:0%"></i></div>
+    <div class="muted small" style="margin-top:8px">Le modèle (49 Mo) est téléchargé une fois, puis conservé par le navigateur.</div>
+  </section>
+
+  <section id="play" hidden>
+    <div class="turn" id="turn">Coup 1</div>
+    <div class="prop" id="prop">…</div>
+    <div class="muted small" id="propinfo"></div>
+    <form id="playform" autocomplete="off">
+      <input id="word" placeholder="mot joué" spellcheck="false" aria-label="mot joué">
+      <input id="temp" placeholder="°C" inputmode="decimal" aria-label="température en °C">
+      <input id="perm" placeholder="‰" inputmode="numeric" aria-label="rang ‰ (optionnel)" title="rang ‰ affiché par le site, optionnel">
+      <button class="primary" id="ok" type="submit">Valider</button>
+    </form>
+    <div class="actions">
+      <button class="link" id="unknown" type="button">le site ne connaît pas ce mot</button>
+      <button class="link" id="found" type="button">trouvé</button>
+      <button class="link" id="reset" type="button">nouvelle partie</button>
+    </div>
+    <div id="msg" class="muted"></div>
+  </section>
+
+  <section id="cands" hidden>
+    <div class="cands" id="candtext"></div>
+  </section>
+
+  <section id="hist" hidden>
+    <table>
+      <thead><tr><th>#</th><th>mot</th><th class="num">°C</th><th></th><th class="num">‰</th><th class="num">restants</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+
+  <footer>
+    Jouez sur cemantix.certitudes.org et reportez ici le °C obtenu. Chaque score est une contrainte exacte sur le mot
+    secret ; la page garde les mots compatibles et propose le plus informatif. Tout s'exécute dans le navigateur.
+    <a href="https://github.com/andronedev/cemantix-solver">Code source</a>.
+  </footer>
+</main>
+
+<script type="module">
+import init, { Engine } from './pkg/cemantix_web.js';
+
+const $ = id => document.getElementById(id);
+const fmtN = n => n.toLocaleString('fr-FR');
+const fmtC = s => (s * 100).toFixed(2).replace('.', ',');
+const fmtB = b => b.toFixed(1).replace('.', ',');
+function emoji(s, p) {
+  if (p === 1000) return '🥳';
+  if (p != null) return p >= 999 ? '😱' : p >= 990 ? '🔥' : p >= 900 ? '🥵' : '😎';
+  return s > 0 ? '🥶' : '🧊';
+}
+
+let engine = null, meta = null, N = 0;
+const st = { n: 1, history: [], proposal: null, solved: null };
+
+async function loadAsset(url, onProgress) {
+  let cache = null;
+  try { cache = await caches.open('cemantix-assistant-v1'); } catch (_) {}
+  if (cache) {
+    const hit = await cache.match(url);
+    if (hit) return await hit.arrayBuffer();
+  }
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`${url} : HTTP ${resp.status}`);
+  const total = +resp.headers.get('content-length') || 0;
+  const reader = resp.body.getReader();
+  const chunks = []; let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    if (onProgress) onProgress(got, total);
+  }
+  const buf = new Uint8Array(got); let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+  if (cache) cache.put(url, new Response(buf, { headers: { 'Content-Type': 'application/octet-stream' } })).catch(() => {});
+  return buf.buffer;
+}
+
+function setMsg(text, cls = 'muted') { $('msg').textContent = text; $('msg').className = cls; }
+
+function renderCands(top) {
+  const n = engine.candidates();
+  const list = top || JSON.parse(engine.top(12));
+  const el = $('candtext'); el.innerHTML = '';
+  const b = document.createElement('b');
+  b.textContent = n === 1 ? 'Un seul candidat compatible : ' : `${fmtN(n)} candidats compatibles`;
+  el.appendChild(b);
+  if (n > 1) el.appendChild(document.createTextNode(', les plus fréquents : '));
+  list.forEach((w, i) => {
+    const a = document.createElement('a');
+    a.textContent = w; a.title = 'jouer ce mot';
+    a.onclick = () => { $('word').value = w; onWordInput(); $('temp').focus(); };
+    el.appendChild(a);
+    if (i < list.length - 1) el.appendChild(document.createTextNode(', '));
+  });
+  if (n > list.length) el.appendChild(document.createTextNode(` et ${fmtN(n - list.length)} autres.`));
+  else el.appendChild(document.createTextNode('.'));
+}
+
+function renderHistory() {
+  const tb = $('rows'); tb.innerHTML = '';
+  for (const g of st.history) {
+    const tr = document.createElement('tr');
+    if (g.unknown) tr.className = 'unknown';
+    if (g.win) tr.className = 'win';
+    const cells = g.unknown ? [g.n, g.word, '', 'inconnu', '', '']
+      : g.win ? [g.n, g.word, '100,00', '🥳', '1000', '1']
+      : [g.n, g.word, fmtC(g.score), emoji(g.score, g.p), g.p ?? '', fmtN(g.after)];
+    cells.forEach((c, i) => {
+      const td = document.createElement('td');
+      if (i === 2 || i === 4 || i === 5) td.className = 'num';
+      td.textContent = c;
+      if (i === 1 && g.you) { td.textContent += ' '; const s = document.createElement('span'); s.className = 'muted small'; s.textContent = '(votre choix)'; td.appendChild(s); }
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  }
+  $('hist').hidden = st.history.length === 0;
+}
+
+function propose() {
+  st.proposal = JSON.parse(engine.next_guess());
+  const p = st.proposal;
+  $('turn').textContent = `Coup ${st.n}`;
+  $('prop').textContent = p.word;
+  $('propinfo').textContent = p.opener ? `Premier mot précalculé : environ 12,5 bits d'information attendus.`
+    : p.candidates === 1 ? `Dernier candidat compatible avec tous vos scores.`
+    : `${fmtB(p.entropy)} bits attendus, ${fmtN(p.buckets)} réponses possibles parmi ${fmtN(p.candidates)} candidats.`;
+  $('word').value = p.word; $('temp').value = ''; $('perm').value = '';
+  $('temp').focus();
+}
+
+function parseTemp(s) {
+  s = s.trim().replace(',', '.').replace('°C', '').replace('%', '').trim();
+  if (!s) return NaN;
+  return parseFloat(s);
+}
+
+function currentIdx() {
+  const w = $('word').value.trim().toLowerCase();
+  if (!w) return null;
+  if (w === st.proposal.word) return st.proposal.idx;
+  const idx = engine.lookup(w);
+  return idx == null ? null : idx;
+}
+
+let evalTimer = null;
+function onWordInput() {
+  clearTimeout(evalTimer);
+  evalTimer = setTimeout(() => {
+    const w = $('word').value.trim().toLowerCase();
+    if (!w || w === st.proposal.word) { setMsg(''); return; }
+    const idx = engine.lookup(w);
+    if (idx == null) { setMsg(`« ${w} » est absent du modèle. Le site n'accepte que les singuliers et les infinitifs.`, 'err'); return; }
+    const ev = JSON.parse(engine.evaluate(idx));
+    const ref = st.proposal.opener ? '12,5' : fmtB(st.proposal.entropy);
+    setMsg(`« ${w} » : ${fmtB(ev.entropy)} bits attendus${ev.candidate ? '' : ', et ce n’est pas un candidat'} ; la proposition en apporte ${ref}.`);
+  }, 200);
+}
+
+function validate() {
+  if (st.solved) return;
+  const idx = currentIdx();
+  const w = $('word').value.trim().toLowerCase();
+  if (idx == null) { setMsg(`« ${w} » est absent du modèle.`, 'err'); return; }
+  const t = parseTemp($('temp').value);
+  if (isNaN(t) || t < -100 || t > 100) { setMsg('Indiquez le °C affiché par le site, par exemple 8,89.', 'err'); $('temp').focus(); return; }
+  const p = $('perm').value.trim() ? parseInt($('perm').value, 10) : null;
+  const score = Math.round(t * 100) / 10000;
+  if (score >= 0.9999 || p === 1000) { win(w); return; }
+  const res = JSON.parse(engine.observe(idx, score));
+  st.history.push({ n: st.n, word: w, score, p, after: res.after, you: w !== st.proposal.word });
+  st.n++;
+  renderHistory(); renderCands(res.top);
+  if (res.after === 0) setMsg('Plus aucun mot compatible, même en élargissant. Vérifiez les scores saisis.', 'err');
+  else if (res.relaxed) setMsg(`Scores légèrement incohérents : tolérance élargie à ${res.tol}. Vérifiez la saisie.`);
+  else setMsg('');
+  propose();
+}
+
+function unknown() {
+  if (st.solved) return;
+  const idx = currentIdx();
+  const w = $('word').value.trim().toLowerCase();
+  if (idx == null) { setMsg(`« ${w} » est absent du modèle.`, 'err'); return; }
+  engine.ban(idx);
+  st.history.push({ n: st.n, word: w, unknown: true });
+  renderHistory(); renderCands();
+  setMsg('');
+  propose();
+}
+
+function win(w) {
+  st.solved = w;
+  st.history.push({ n: st.n, word: w, win: true });
+  renderHistory();
+  $('candtext').textContent = '';
+  $('cands').hidden = true;
+  $('turn').textContent = 'Terminé';
+  $('prop').textContent = w; $('propinfo').textContent = '';
+  setMsg(`Trouvé en ${st.n} coup${st.n > 1 ? 's' : ''}.`, 'win');
+  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found']) $(id).disabled = true;
+}
+
+function reset() {
+  engine.reset();
+  st.n = 1; st.history = []; st.solved = null;
+  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found']) $(id).disabled = false;
+  $('cands').hidden = false;
+  renderHistory(); renderCands(); setMsg(''); propose();
+}
+
+$('playform').addEventListener('submit', e => { e.preventDefault(); validate(); });
+$('unknown').onclick = unknown;
+$('found').onclick = () => { if (st.solved) return; const w = $('word').value.trim().toLowerCase(); if (currentIdx() != null) win(w); else setMsg(`« ${w} » est absent du modèle.`, 'err'); };
+$('reset').onclick = reset;
+$('word').addEventListener('input', onWordInput);
+
+(async () => {
+  try {
+    await init();
+    meta = await (await fetch('meta.json')).json();
+    const words = new TextDecoder().decode(await loadAsset('words.txt'));
+    $('loadmsg').textContent = 'Téléchargement du modèle';
+    const f16 = new Uint8Array(await loadAsset('model.f16', (got, total) => {
+      const pct = total ? Math.round(100 * got / total) : 0;
+      $('loadbar').style.width = pct + '%';
+      $('loadmsg').textContent = `Téléchargement du modèle, ${(got / 1e6).toFixed(0)}${total ? ` / ${(total / 1e6).toFixed(0)}` : ''} Mo`;
+    }));
+    $('loadbar').style.width = '100%'; $('loadmsg').textContent = 'Décodage des vecteurs';
+    await new Promise(r => setTimeout(r, 30));
+    engine = new Engine(f16, words, meta.dim, meta.opener ?? undefined, meta.tol_level ?? 0);
+    N = engine.n();
+    $('sub').textContent = `${fmtN(N)} mots, ${meta.dim} dimensions, modèle ${meta.model}.`;
+    $('loading').hidden = true;
+    for (const id of ['play', 'cands']) $(id).hidden = false;
+    renderCands(); propose();
+  } catch (e) {
+    $('loadmsg').textContent = 'Erreur : ' + (e && e.message ? e.message : e);
+    console.error(e);
+  }
+})();
+</script>
+</body>
+</html>

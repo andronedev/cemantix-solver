@@ -1,0 +1,14 @@
+[package]
+name = "cemantix"
+version = "0.1.0"
+edition = "2024"
+description = "Solver Cémantix : trilatération dans l'espace word2vec"
+
+[dependencies]
+cemantix-core = { path = "../core", features = ["parallel"] }
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+rayon = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2", features = ["json"] }

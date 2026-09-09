@@ -1,0 +1,9 @@
+{
+  "dim": 500,
+  "f16_max_score_error": 0.00011283159255981445,
+  "model": "frWac_no_postag_phrase_500_cbow_cut10",
+  "n": 48965,
+  "opener": "mais",
+  "prior_rank": 50000,
+  "tol_level": 1
+}

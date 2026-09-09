@@ -1,0 +1,12 @@
+[package]
+name = "cemantix-core"
+version = "0.1.0"
+edition = "2024"
+description = "Cémantix solver core: exact-score constraints in word2vec space"
+
+[dependencies]
+rayon = { version = "1.12", optional = true }
+
+[features]
+default = []
+parallel = ["dep:rayon"]
