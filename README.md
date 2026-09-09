@@ -1,5 +1,7 @@
 # cemantix-solver
 
+**Essayer dans le navigateur : [andronedev.github.io/cemantix-solver](https://andronedev.github.io/cemantix-solver/)**
+
 Un solver pour [Cémantix](https://cemantix.certitudes.org) (et [QuelMot](https://quelmot.fr)), écrit en Rust.
 Il trouve le mot du jour en trois coups, presque à chaque fois.
 
