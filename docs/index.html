@@ -30,9 +30,9 @@ input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(31
 button{font:inherit;cursor:pointer;border-radius:4px}
 button.primary{background:var(--accent);color:#fff;border:1px solid var(--accent);padding:8px 16px}
 button.primary:disabled{opacity:.4;cursor:default}
-button.link{background:none;border:0;padding:0;color:var(--accent);text-decoration:underline;text-underline-offset:3px;font-size:14px}
+button.link{background:none;border:0;padding:0;color:var(--accent);text-decoration:underline;text-underline-offset:3px;font-size:14px;white-space:nowrap}
 button.link:disabled{color:var(--muted);text-decoration:none;cursor:default}
-.actions{display:flex;gap:18px;margin-top:12px;align-items:baseline}
+.actions{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:12px;align-items:baseline}
 #msg{margin-top:12px;font-size:14px;min-height:1.5em}
 #msg.err{color:#b3261e}
 #msg.win{color:var(--fg);font-weight:600;font-size:16px}
@@ -50,6 +50,10 @@ tr.unknown td{color:var(--muted);text-decoration:line-through}
 tr.win td{font-weight:600}
 .progress{height:2px;background:var(--line);margin-top:10px}
 .progress i{display:block;height:100%;background:var(--accent);transition:width .3s}
+#modes{margin-top:8px}
+.clue{margin-top:14px;font-size:15px;line-height:1.55}
+.clue .lvl{display:block;font-weight:500;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.clue .words{font-weight:600}
 footer{margin-top:56px;font-size:13px;color:var(--muted)}
 footer a{color:var(--muted)}
 </style>
@@ -61,6 +65,10 @@ footer a{color:var(--muted)}
   <div class="games" id="games" hidden>
     <button type="button" data-game="cemantix" aria-pressed="true">Cémantix</button>
     <button type="button" data-game="quelmot" aria-pressed="false">QuelMot</button>
+  </div>
+  <div class="games" id="modes" hidden>
+    <button type="button" data-mode="assist" aria-pressed="true">Assistant</button>
+    <button type="button" data-mode="clues" aria-pressed="false">Indices</button>
   </div>
 
   <section id="loading">
@@ -80,12 +88,17 @@ footer a{color:var(--muted)}
       <button class="primary" id="ok" type="submit">Valider</button>
     </form>
     <div class="actions">
-      <button class="link" id="hint" type="button" hidden title="un mot 🎁 offert par le site : il compte comme une observation, pas comme un coup">indice 🎁</button>
+      <button class="link" id="clue" type="button" hidden>un indice</button>
+      <button class="link" id="freeword" type="button" hidden title="un mot 🎁 offert par le site : il compte comme une observation, pas comme un coup">mot offert 🎁</button>
       <button class="link" id="unknown" type="button">le site ne connaît pas ce mot</button>
       <button class="link" id="found" type="button">trouvé</button>
       <button class="link" id="reset" type="button">nouvelle partie</button>
     </div>
     <div id="msg" class="muted"></div>
+  </section>
+
+  <section id="clues" hidden>
+    <div id="cluelist"></div>
   </section>
 
   <section id="cands" hidden>
@@ -121,31 +134,34 @@ const fmtB = b => b.toFixed(1).replace('.', ',');
 //
 // QuelMot returns a rank: 1000 − the position of your word among the secret's
 // neighbours, floored at −999. A word with no link scores −999 straight away and
-// teaches almost nothing, which is why the 🎁 hints are worth so much: they are
+// teaches almost nothing, which is why the 🎁 free words are worth so much: they are
 // free observations at known ranks.
 const GAMES = {
   cemantix: {
     name: 'Cémantix', site: 'cemantix.certitudes.org', kind: 'cosine',
     placeholder: '°C', head: '°C', side: '‰', example: '8,89', min: -100, max: 100,
-    permille: true, hints: false,
+    permille: true, freeWords: false,
     parse: t => Math.round(t * 100) / 10000,
     fmt: s => (s * 100).toFixed(2).replace('.', ','),
     won: (s, p) => s >= 0.9999 || p === 1000,
-    hint: 'Jouez sur cemantix.certitudes.org et reportez ici le °C obtenu.',
+    footer: 'Jouez sur cemantix.certitudes.org et reportez ici le °C obtenu.',
     why: 'Chaque score est une contrainte exacte sur le mot secret ; la page garde les mots compatibles et propose le plus informatif.',
   },
   quelmot: {
     name: 'QuelMot', site: 'quelmot.fr', kind: 'rank',
     placeholder: 'score', head: 'score', side: 'rang', example: '399', min: -999, max: 1000,
-    permille: false, hints: true,
+    permille: false, freeWords: true,
     parse: t => Math.round(t),
     fmt: s => String(Math.round(s)),
     won: s => Math.round(s) >= 1000,
-    hint: 'Jouez sur quelmot.fr et reportez ici le score obtenu (entier entre -999 et 1000), indices 🎁 compris.',
-    why: 'Le score de QuelMot est un rang, pas une température : 1000 moins la place de votre mot parmi les voisins du secret. Chaque réponse enferme le secret dans une bande de rangs ; un mot sans lien tombe à −999 et n’apprend presque rien, alors que les indices 🎁 valent chacun un coup.',
+    footer: 'Jouez sur quelmot.fr et reportez ici le score obtenu (entier entre -999 et 1000), mots offerts 🎁 compris.',
+    why: 'Le score de QuelMot est un rang, pas une température : 1000 moins la place de votre mot parmi les voisins du secret. Chaque réponse enferme le secret dans une bande de rangs ; un mot sans lien tombe à −999 et n’apprend presque rien, alors que les mots offerts 🎁 valent chacun un coup.',
   },
 };
 let game = GAMES.cemantix;
+// 'assist' montre le mot le plus informatif et les candidats ; 'clues' ne montre rien de
+// tout cela et ne livre que les paliers d'indices demandés.
+let mode = 'assist';
 const fmtC = s => game.fmt(s);
 
 function emoji(s, p) {
@@ -171,7 +187,7 @@ function sideValue(g) {
 }
 
 let engine = null, meta = null, N = 0;
-const st = { n: 1, history: [], proposal: null, solved: null, busy: false };
+const st = { n: 1, history: [], proposal: null, solved: null, busy: false, clues: [] };
 
 async function loadAsset(url, onProgress) {
   let cache = null;
@@ -201,8 +217,15 @@ function setMsg(text, cls = 'muted') { $('msg').textContent = text; $('msg').cla
 
 function renderCands(top) {
   const n = engine.candidates();
-  const list = top || JSON.parse(engine.top(12));
   const el = $('candtext'); el.innerHTML = '';
+  if (mode === 'clues') {
+    // La branche n === 1 ci-dessous est le pire spoiler de la page : elle nomme la réponse.
+    el.textContent = n === 1
+      ? 'Un seul mot est encore compatible : les indices portent maintenant sur lui.'
+      : `${fmtN(n)} mots encore compatibles.`;
+    return;
+  }
+  const list = top || JSON.parse(engine.top(12));
   const b = document.createElement('b');
   b.textContent = n === 1 ? 'Un seul candidat compatible : ' : `${fmtN(n)} candidats compatibles`;
   el.appendChild(b);
@@ -224,7 +247,7 @@ function renderHistory() {
     const tr = document.createElement('tr');
     if (g.unknown) tr.className = 'unknown';
     if (g.win) tr.className = 'win';
-    const label = g.hint ? '🎁' : g.n;
+    const label = g.free ? '🎁' : g.n;
     const cells = g.unknown ? [label, g.word, '', 'inconnu', '', '']
       : g.win ? [label, g.word, fmtC(game.kind === 'rank' ? 1000 : 1), '🥳', game.kind === 'rank' ? '1' : '1000', '1']
       : [label, g.word, fmtC(g.score), emoji(g.score, g.p), sideValue(g), fmtN(g.after)];
@@ -240,10 +263,107 @@ function renderHistory() {
   $('hist').hidden = st.history.length === 0;
 }
 
+// ── indices ──
+//
+// Le moteur connaît la réponse bien avant le joueur, donc un indice se construit avec ce
+// qui entoure les candidats survivants sans jamais en être un. Chaque palier est demandé
+// explicitement, puis figé : l'ensemble des candidats rétrécit entre deux clics, et un
+// palier recalculé pourrait devenir plus précis que le suivant.
+
+const RUNGS = {
+  field: 'le champ sémantique, de loin',
+  tight: 'le champ, de plus près',
+  near: 'un mot très proche',
+};
+const LEADS = {
+  field: 'Le mot secret gravite autour de ',
+  tight: 'Plus près du secret : ',
+  near: 'Un mot très proche du secret, mais ce n’est pas lui : ',
+};
+
+function lockedText(h) {
+  return {
+    no_candidate: 'Plus aucun mot n’est compatible avec vos scores. Vérifiez la saisie avant de demander un indice.',
+    too_many: `Encore ${fmtN(h.alive)} mots compatibles : aucun indice ne serait vrai pour tous. Reportez un score de plus, il n’en faut en général qu’un.`,
+    scattered: `Les ${fmtN(h.alive)} candidats restants n’ont aucun champ commun. Reportez un score de plus.`,
+    exhausted: 'Aucun mot ne convient pour cet indice.',
+    ended: 'Vous avez déjà tous les indices.',
+  }[h.rung] ?? '';
+}
+
+function renderClues() {
+  const el = $('cluelist'); el.innerHTML = '';
+  st.clues.forEach((h, i) => {
+    const d = document.createElement('div'); d.className = 'clue';
+    const lvl = document.createElement('span'); lvl.className = 'lvl';
+    lvl.textContent = `indice ${i + 1} — ${RUNGS[h.rung] ?? ''}`;
+    const p = document.createElement('div');
+    const words = document.createElement('span'); words.className = 'words';
+    words.textContent = h.words.join(', ');
+    p.append(document.createTextNode(LEADS[h.rung] ?? ''), words, document.createTextNode('.'));
+    d.append(lvl, p); el.appendChild(d);
+  });
+  // Section masquée tant qu'aucun palier n'a été demandé, sinon elle laisse un blanc.
+  $('clues').hidden = mode !== 'clues' || st.clues.length === 0;
+  const left = engine.hint_levels() - st.clues.length;
+  $('clue').textContent = st.clues.length === 0 ? 'un indice'
+    : left > 0 ? `un indice de plus (${left})`
+    : 'plus d’indice';
+  $('clue').disabled = left <= 0 || !!st.solved || st.busy;
+}
+
+function askClue() {
+  if (st.solved || st.busy) return;
+  const revealed = Uint32Array.from(st.clues.flatMap(h => h.idx));
+  const h = JSON.parse(engine.hint(st.clues.length, revealed));
+  // Un refus ne consomme aucun palier : sinon un clic au premier coup, quand rien n'est
+  // encore vrai du secret, brûlerait définitivement l'indice le plus vague.
+  if (h.kind === 'locked') { setMsg(lockedText(h)); return; }
+  st.clues.push(h);
+  setMsg(''); renderClues();
+}
+
+// Chaud/froid : le joueur voit déjà son °C monter ou descendre. Ce qu'il ne voit pas, c'est
+// si son mot colle au champ des candidats encore en lice — sans jamais lui dire si c'en est
+// un, ce qui serait une réponse complète et non un indice.
+function warmthText(w) {
+  if (w.locked) return 'Encore trop de mots compatibles pour dire chaud ou froid.';
+  if (!w.best) return '';
+  if (w.best === w.word) return `« ${w.word} » est votre meilleur essai jusqu’ici.`;
+  return w.fit > w.best_fit
+    ? `« ${w.word} » colle mieux au champ des candidats que « ${w.best} », votre meilleur essai.`
+    : `« ${w.word} » colle moins bien que « ${w.best} », votre meilleur essai.`;
+}
+
+function progressText(idx) {
+  const w = JSON.parse(engine.warmth(idx));
+  if (w.locked || !w.best) return '';
+  return w.best === w.word
+    ? 'Votre meilleur essai jusqu’ici : vous vous rapprochez.'
+    : `« ${w.best} » colle toujours mieux au champ des candidats restants.`;
+}
+
+function renderFooter() {
+  $('footwhy').textContent = game.why + (mode === 'clues'
+    ? ' En mode Indices, la page ne montre ni le mot proposé ni les candidats : elle ne livre que ce que vous lui demandez.'
+    : '');
+}
+
+function setMode(key) {
+  mode = key === 'clues' ? 'clues' : 'assist';
+  for (const b of document.querySelectorAll('#modes button')) b.setAttribute('aria-pressed', String(b.dataset.mode === mode));
+  $('clue').hidden = mode !== 'clues';
+  $('prop').hidden = mode === 'clues' && !st.solved;
+  renderFooter();
+  try { localStorage.setItem('assistant-mode', mode); } catch (_) {}
+  // Basculer ne réinitialise rien : les scores déjà reportés valent dans les deux modes.
+  if (engine) { setMsg(''); renderClues(); renderCands(); propose(); }
+}
+
 function setBusy(b) {
   st.busy = b;
   const off = b || !!st.solved;
-  for (const id of ['ok', 'unknown', 'found', 'hint']) $(id).disabled = off;
+  for (const id of ['ok', 'unknown', 'found', 'freeword', 'clue']) $(id).disabled = off;
 }
 
 // Choosing a guess can take a moment on a rank game, where the whole lexicon is still
@@ -251,6 +371,17 @@ function setBusy(b) {
 function propose() {
   st.proposal = null;
   $('turn').textContent = `Coup ${st.n}`;
+  if (mode === 'clues') {
+    // next_guess() est à la fois l'appel coûteux et celui qui nomme le mot : en mode
+    // indices on ne le fait pas du tout. `win()` réaffiche #prop pour montrer le mot
+    // trouvé, donc c'est ici qu'il faut le remasquer au coup suivant.
+    $('prop').hidden = true; $('prop').textContent = '';
+    $('propinfo').textContent = '';
+    $('word').value = ''; $('temp').value = ''; $('perm').value = '';
+    setBusy(false); renderClues();
+    $('word').focus();
+    return;
+  }
   $('prop').textContent = '…';
   $('propinfo').textContent = 'recherche du mot le plus informatif…';
   setBusy(true);
@@ -285,18 +416,19 @@ function onWordInput() {
   clearTimeout(evalTimer);
   evalTimer = setTimeout(() => {
     const w = $('word').value.trim().toLowerCase();
-    if (!w || !st.proposal || w === st.proposal.word) { setMsg(''); return; }
+    if (!w || (mode === 'assist' && (!st.proposal || w === st.proposal.word))) { setMsg(''); return; }
     const idx = engine.lookup(w);
     if (idx == null) { setMsg(`« ${w} » est absent du modèle. Le site n'accepte que les singuliers et les infinitifs.`, 'err'); return; }
+    if (mode === 'clues') { setMsg(warmthText(JSON.parse(engine.warmth(idx)))); return; }
     const ev = JSON.parse(engine.evaluate(idx));
     const ref = fmtB(st.proposal.entropy);
     setMsg(`« ${w} » : ${fmtB(ev.entropy)} bits attendus${ev.candidate ? '' : ', et ce n’est pas un candidat'} ; la proposition en apporte ${ref}.`);
   }, 200);
 }
 
-/// Feed one answer to the solver. A hint is an observation like any other, it just does
-/// not cost a turn.
-function record(hint) {
+/// Feed one answer to the solver. A word the site gave away is an observation like any
+/// other, it just does not cost a turn.
+function record(free) {
   if (st.solved || st.busy) return;
   const idx = currentIdx();
   const w = $('word').value.trim().toLowerCase();
@@ -306,14 +438,14 @@ function record(hint) {
   const p = game.permille && $('perm').value.trim() ? parseInt($('perm').value, 10) : null;
   const score = game.parse(t);
   if (game.won(score, p)) { win(w); return; }
-  const you = !st.proposal || w !== st.proposal.word;
+  const you = mode === 'assist' && (!st.proposal || w !== st.proposal.word);
   const res = JSON.parse(engine.observe(idx, score));
-  st.history.push({ n: st.n, word: w, score, p, after: res.after, you, hint });
-  if (!hint) st.n++;
+  st.history.push({ n: st.n, word: w, score, p, after: res.after, you, free });
+  if (!free) st.n++;
   renderHistory(); renderCands(res.top);
   if (res.after === 0) setMsg('Plus aucun mot compatible, même en élargissant. Vérifiez les scores saisis.', 'err');
   else if (res.relaxed) setMsg(`Scores légèrement incohérents : tolérance élargie à ${res.tol}. Vérifiez la saisie.`);
-  else setMsg('');
+  else setMsg(mode === 'clues' ? progressText(idx) : '');
   propose();
 }
 
@@ -336,9 +468,10 @@ function win(w) {
   $('candtext').textContent = '';
   $('cands').hidden = true;
   $('turn').textContent = 'Terminé';
+  $('prop').hidden = false;
   $('prop').textContent = w; $('propinfo').textContent = '';
   setMsg(`Trouvé en ${st.n} coup${st.n > 1 ? 's' : ''}.`, 'win');
-  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found', 'hint']) $(id).disabled = true;
+  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found', 'freeword', 'clue']) $(id).disabled = true;
 }
 
 function setGame(key) {
@@ -353,23 +486,26 @@ function setGame(key) {
   $('scorehead').textContent = game.head;
   $('sidehead').textContent = game.side;
   $('perm').hidden = !game.permille;
-  $('hint').hidden = !game.hints;
-  $('foothint').textContent = game.hint;
-  $('footwhy').textContent = game.why;
+  $('freeword').hidden = !game.freeWords;
+  $('foothint').textContent = game.footer;
+  renderFooter();
   try { localStorage.setItem('assistant-game', key); } catch (_) {}
   if (engine) reset();
 }
 
 function reset() {
   engine.reset();
-  st.n = 1; st.history = []; st.solved = null;
-  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found', 'hint']) $(id).disabled = false;
+  st.n = 1; st.history = []; st.solved = null; st.clues = [];
+  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found', 'freeword', 'clue']) $(id).disabled = false;
   $('cands').hidden = false;
-  renderHistory(); renderCands(); setMsg(''); propose();
+  renderHistory(); renderCands(); renderClues(); setMsg(''); propose();
 }
 
 $('playform').addEventListener('submit', e => { e.preventDefault(); record(false); });
-$('hint').onclick = () => record(true);
+$('freeword').onclick = () => record(true);
+$('clue').onclick = askClue;
+for (const b of document.querySelectorAll('#modes button'))
+  b.onclick = () => { if (!engine || b.getAttribute('aria-pressed') === 'true') return; setMode(b.dataset.mode); };
 $('unknown').onclick = unknown;
 $('found').onclick = () => { if (st.solved) return; const w = $('word').value.trim().toLowerCase(); if (currentIdx() != null) win(w); else setMsg(`« ${w} » est absent du modèle.`, 'err'); };
 $('reset').onclick = reset;
@@ -412,11 +548,14 @@ $('word').addEventListener('input', onWordInput);
         b.title = 'table de rangs absente de cet export (cargo run -- build-ranks puis export-web)';
       }
     }
+    let m = 'assist';
+    try { m = localStorage.getItem('assistant-mode') || m; } catch (_) {}
+    mode = m === 'clues' ? 'clues' : 'assist';
     setGame(key);
     $('sub').textContent = `${fmtN(N)} mots, ${meta.dim} dimensions, modèle ${meta.model}.`;
     $('loading').hidden = true;
-    for (const id of ['play', 'cands', 'games']) $(id).hidden = false;
-    renderCands(); propose();
+    for (const id of ['play', 'cands', 'games', 'modes']) $(id).hidden = false;
+    setMode(mode);
   } catch (e) {
     $('loadmsg').textContent = 'Erreur : ' + (e && e.message ? e.message : e);
     console.error(e);

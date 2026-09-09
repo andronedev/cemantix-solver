@@ -4,7 +4,9 @@ mod game;
 mod model;
 
 use anyhow::{Context, Result, bail};
-use cemantix_core::{RankModel, Scoring};
+use cemantix_core::{
+    HINT_FAMILIAR_RANK, Hint, HintLevel, RankModel, Scoring, Solver, Vectors, dot, shares_stem,
+};
 use clap::{Parser, Subcommand};
 use events::Event;
 use game::{LocalOracle, Oracle, play_game, print_event};
@@ -118,6 +120,19 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Print the hint ladder for words, or audit the bands over random targets
+    Hints {
+        /// Words to inspect (« cemantix hints pilier cactus »)
+        words: Vec<String>,
+        /// Instead: audit N random targets and report the band failure rates
+        #[arg(long)]
+        audit: Option<usize>,
+        /// Targets are drawn among plausible words with frequency rank below this
+        #[arg(long, default_value_t = 30000)]
+        prior: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Solve today's puzzle (or an offline secret)
     Play {
         /// Puzzle number (default: today's, read from the home page)
@@ -176,6 +191,12 @@ fn main() -> Result<()> {
             jitter,
             verbose,
         } => sim(&cli.data, n, seed, prior, &opts, sim_alpha, jitter, verbose),
+        Cmd::Hints {
+            words,
+            audit,
+            prior,
+            seed,
+        } => hints(&cli.data, &words, audit, prior, seed),
         Cmd::Play {
             day,
             dry_run,
@@ -185,6 +206,139 @@ fn main() -> Result<()> {
             opts,
         } => play(&cli.data, day, dry_run, start, choose, delay, &opts),
     }
+}
+
+/// A solver pinned to one known secret. That is the regime the hint ladder was calibrated
+/// on: 81 % of Cémantix games leave exactly one candidate on the second answer.
+fn pin(model: &Vectors, secret: u32) -> Solver<'_> {
+    let mut s = Solver::new(model);
+    s.alive.iter_mut().for_each(|a| *a = false);
+    s.alive[secret as usize] = true;
+    s.alive_count = 1;
+    s
+}
+
+/// The three rungs for one secret, plus the indices they revealed.
+fn ladder(model: &Vectors, secret: u32) -> Vec<(HintLevel, Vec<u32>)> {
+    let solver = pin(model, secret);
+    let mut revealed: Vec<u32> = Vec::new();
+    let mut out = Vec::new();
+    for level in 0..HintLevel::LADDER.len() {
+        if let Hint::Words { level: rung, words } = solver.hint(level, &revealed) {
+            revealed.extend(words.iter().copied());
+            out.push((rung, words));
+        }
+    }
+    out
+}
+
+/// Print the ladder, or audit the bands. The bands and the familiarity cap are constants
+/// in `cemantix_core`; this is the tool that says what moving one would cost.
+fn hints(data: &Path, words: &[String], audit: Option<usize>, prior: usize, seed: u64) -> Result<()> {
+    let model = model::load(data)?;
+    if let Some(n) = audit {
+        return audit_hints(&model, n, prior, seed);
+    }
+    if words.is_empty() {
+        bail!("donnez au moins un mot, ou --audit N");
+    }
+    for w in words {
+        let Some(idx) = model.lookup(w) else {
+            println!("{w} : absent du modèle");
+            continue;
+        };
+        println!("« {w} »");
+        for (rung, hint) in ladder(&model, idx) {
+            let shown: Vec<String> = hint
+                .iter()
+                .map(|&i| {
+                    format!(
+                        "{} ({:.2})",
+                        model.words[i as usize],
+                        dot(model.vec(i as usize), model.vec(idx as usize))
+                    )
+                })
+                .collect();
+            println!("  {:<6} {}", rung.name(), shown.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn audit_hints(model: &Vectors, n: usize, prior: usize, seed: u64) -> Result<()> {
+    let pool: Vec<u32> = model
+        .plausible_indices()
+        .into_iter()
+        .filter(|&i| (i as usize) < prior)
+        .collect();
+    let levels = HintLevel::LADDER.len();
+    let mut short = vec![0usize; levels];
+    let mut leaks = vec![0usize; levels];
+    let mut rare = vec![0usize; levels];
+    let mut sims: Vec<Vec<f32>> = vec![Vec::new(); levels];
+    let mut missing = 0usize;
+    let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    for k in 0..n {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let secret = pool[((rng >> 33) as usize) % pool.len()];
+        let rungs = ladder(model, secret);
+        if rungs.len() < levels {
+            missing += 1;
+            println!(
+                "  échelle incomplète pour « {} » (rang {secret}) : {} palier(s)",
+                model.words[secret as usize],
+                rungs.len()
+            );
+        }
+        for (rung, hint) in rungs {
+            let l = HintLevel::LADDER.iter().position(|&r| r == rung).unwrap();
+            if hint.len() < rung.band().2 {
+                short[l] += 1;
+            }
+            for &i in &hint {
+                if shares_stem(&model.words[i as usize], &model.words[secret as usize]) {
+                    leaks[l] += 1;
+                    println!(
+                        "  fuite de radical : « {} » pour « {} »",
+                        model.words[i as usize], model.words[secret as usize]
+                    );
+                }
+                if i as usize >= HINT_FAMILIAR_RANK {
+                    rare[l] += 1;
+                }
+                sims[l].push(dot(model.vec(i as usize), model.vec(secret as usize)));
+            }
+        }
+        if (k + 1) % 50 == 0 {
+            eprintln!("  {}/{n}", k + 1);
+        }
+    }
+    println!(
+        "{n} cibles tirées parmi {} mots (rang < {prior}), plafond de familiarité {HINT_FAMILIAR_RANK}",
+        pool.len()
+    );
+    println!("{} cible(s) sans échelle complète", missing);
+    println!("palier  positions   pris  courts  fuites  rares  cos médian");
+    for (l, &rung) in HintLevel::LADDER.iter().enumerate() {
+        let (lo, hi, take) = rung.band();
+        let mut s = std::mem::take(&mut sims[l]);
+        s.sort_unstable_by(f32::total_cmp);
+        let med = if s.is_empty() {
+            f32::NAN
+        } else {
+            s[s.len() / 2]
+        };
+        println!(
+            "{:<7} {lo:>4}–{hi:<6} {take:>4}  {:>6}  {:>6}  {:>5}  {med:.3}",
+            rung.name(),
+            short[l],
+            leaks[l],
+            rare[l]
+        );
+    }
+    Ok(())
 }
 
 fn verify(data: &Path) -> Result<()> {

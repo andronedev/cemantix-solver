@@ -973,6 +973,342 @@ impl<'a> Solver<'a> {
     }
 }
 
+// ───────────────────────────── indices ─────────────────────────────
+//
+// The solver knows the answer long before the player does, so a hint has to be built out
+// of what sits *near* the surviving candidates without ever being one of them. Two
+// measurements on the real model (frWac 500d cbow, 48 965 words) shape the design.
+//
+// The mean vector of the surviving candidates is not a semantic object. Cémantix
+// candidates are the shell of words at a fixed cosine from the opener, not a cluster:
+// their centroid has norm ≈ 0.19 and ranks the secret ~30 000th against itself. A hint
+// word is therefore scored by the *minimum* of its cosines to every surviving candidate,
+// which is true of all of them by construction and degenerates to plain neighbour rank
+// once a single candidate is left — the regime 81 % of Cémantix games reach on the second
+// answer.
+//
+// Absolute cosine thresholds cannot be calibrated either: the nearest neighbour of a word
+// sits anywhere between 0.45 and 0.69 depending on the word. The bands below are therefore
+// *positions* in that shared ordering, chosen so that no rung came up short on 120 random
+// targets. `cargo run -- hints --audit N` re-measures them.
+
+/// Above this many surviving candidates, no statement is true of all of them.
+pub const HINT_MAX_SET: usize = 8;
+/// Lowest pairwise cosine the candidates must reach for a shared field to exist. Scattered
+/// Cémantix sets measure 0.01–0.22 ({méfier, intellectuellement, chipoter}); sets that do
+/// share a field start at 0.32.
+pub const HINT_MIN_COHESION: f32 = 0.30;
+/// Hints are drawn from the frequent part of the lexicon: past this frequency rank frWac
+/// is mostly proper nouns and typos (« nallet », « net-iris », « ziki »).
+pub const HINT_FAMILIAR_RANK: usize = 20_000;
+/// Two words of one rung may not exceed this cosine, or the rung says one thing twice.
+pub const HINT_DIVERSITY: f32 = 0.55;
+/// Folded letters in common that make two words morphological relatives.
+pub const HINT_STEM_PREFIX: usize = 4;
+/// `(lo, hi, take)`: the rung takes `take` words from positions `lo..hi` of the shared
+/// neighbourhood.
+pub const HINT_WIDE: (usize, usize, usize) = (200, 900, 4);
+pub const HINT_TIGHT: (usize, usize, usize) = (25, 120, 3);
+pub const HINT_NEAR: (usize, usize, usize) = (2, 12, 1);
+/// A short band is widened by this factor, at most twice, before it is declared exhausted.
+pub const HINT_WIDEN: usize = 2;
+
+/// Lowercase form without French diacritics, for the stem filter. Hand-rolled, and
+/// deliberately not `char::to_lowercase`: that pulls the whole Unicode case table into the
+/// wasm (measured at +40 KB on a 160 KB binary) to fold twenty French letters. The lexicon
+/// is lowercase already — see [`is_plausible_word`] — so the uppercase arms are only there
+/// for words typed by hand.
+pub fn fold_accents(w: &str) -> String {
+    let mut out = String::with_capacity(w.len());
+    for c in w.chars() {
+        match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => out.push('a'),
+            'ç' | 'Ç' => out.push('c'),
+            'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => out.push('e'),
+            'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => out.push('i'),
+            'ñ' | 'Ñ' => out.push('n'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => out.push('o'),
+            'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => out.push('u'),
+            'ý' | 'ÿ' | 'Ý' | 'Ÿ' => out.push('y'),
+            'æ' | 'Æ' => out.push_str("ae"),
+            'œ' | 'Œ' => out.push_str("oe"),
+            _ => out.push(c.to_ascii_lowercase()),
+        }
+    }
+    out
+}
+
+/// Are these two words morphological relatives? Containment once folded, or
+/// [`HINT_STEM_PREFIX`] leading letters in common — « blog »/« blogueur »,
+/// « démonstration »/« démontrer ». A single such word would hand the answer over, so the
+/// test errs on the side of dropping a usable hint.
+pub fn shares_stem(a: &str, b: &str) -> bool {
+    let (fa, fb) = (fold_accents(a), fold_accents(b));
+    let (short, long) = if fa.len() <= fb.len() {
+        (&fa, &fb)
+    } else {
+        (&fb, &fa)
+    };
+    if short.chars().count() >= HINT_STEM_PREFIX && long.contains(short.as_str()) {
+        return true;
+    }
+    fa.chars()
+        .zip(fb.chars())
+        .take_while(|(x, y)| x == y)
+        .count()
+        >= HINT_STEM_PREFIX
+}
+
+/// The rungs of the ladder, from vaguest to most precise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintLevel {
+    /// The semantic field, seen from far away.
+    Field,
+    /// The same field, closer in.
+    Tight,
+    /// One word sitting right next to the secret — and provably not it.
+    Near,
+}
+
+impl HintLevel {
+    pub const LADDER: [HintLevel; 3] = [Self::Field, Self::Tight, Self::Near];
+
+    pub fn at(i: usize) -> Option<Self> {
+        Self::LADDER.get(i).copied()
+    }
+
+    /// `(lo, hi, take)` of this rung's band.
+    pub fn band(self) -> (usize, usize, usize) {
+        match self {
+            Self::Field => HINT_WIDE,
+            Self::Tight => HINT_TIGHT,
+            Self::Near => HINT_NEAR,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Field => "field",
+            Self::Tight => "tight",
+            Self::Near => "near",
+        }
+    }
+}
+
+/// Why no hint can be given right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintLocked {
+    /// The reported scores contradict each other; nothing survives.
+    NoCandidate,
+    /// Too many candidates for a statement to be true of all of them.
+    TooMany { alive: usize },
+    /// The candidates share no field at all.
+    Scattered { alive: usize },
+    /// The band came up empty even after widening.
+    Exhausted,
+    /// Every rung has been handed out.
+    Ended,
+}
+
+impl HintLocked {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NoCandidate => "no_candidate",
+            Self::TooMany { .. } => "too_many",
+            Self::Scattered { .. } => "scattered",
+            Self::Exhausted => "exhausted",
+            Self::Ended => "ended",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Hint {
+    Words { level: HintLevel, words: Vec<u32> },
+    Locked(HintLocked),
+}
+
+/// How well a word fits the surviving candidates, next to the player's own best guess.
+#[derive(Clone, Copy, Debug)]
+pub struct Warmth {
+    pub fit: f32,
+    /// The player's own guess that fits best, and its fit.
+    pub best: Option<(u32, f32)>,
+}
+
+impl<'a> Solver<'a> {
+    /// The candidates every hint must be true of, or `None` when there are too many — or
+    /// none — for any statement to hold.
+    pub fn hint_targets(&self) -> Option<Vec<u32>> {
+        (1..=HINT_MAX_SET)
+            .contains(&self.alive_count)
+            .then(|| self.candidates())
+    }
+
+    /// Lowest cosine between two surviving candidates; 1.0 for a single one. Below
+    /// [`HINT_MIN_COHESION`] the candidates have no field in common, and a hint about
+    /// "the" field would not be honest.
+    pub fn hint_cohesion(&self, targets: &[u32]) -> f32 {
+        let mut lo = 1.0f32;
+        for (k, &a) in targets.iter().enumerate() {
+            for &b in &targets[k + 1..] {
+                lo = lo.min(dot(
+                    self.vectors.vec(a as usize),
+                    self.vectors.vec(b as usize),
+                ));
+            }
+        }
+        lo
+    }
+
+    /// `out[j]` = the smallest cosine between word `j` and any of `targets`: how well `j`
+    /// fits *every* surviving candidate. At most [`HINT_MAX_SET`] matvecs.
+    pub fn hint_scores(&self, targets: &[u32], out: &mut Vec<f32>) {
+        let n = self.vectors.n();
+        out.clear();
+        out.resize(n, f32::INFINITY);
+        let mut buf = vec![0f32; n];
+        for &t in targets {
+            self.vectors.dots_into(t as usize, &mut buf);
+            for (o, &s) in out.iter_mut().zip(buf.iter()) {
+                *o = o.min(s);
+            }
+        }
+    }
+
+    /// Smallest cosine between `idx` and any of `targets`.
+    fn fit_to(&self, idx: u32, targets: &[u32]) -> f32 {
+        let q = self.vectors.vec(idx as usize);
+        targets
+            .iter()
+            .map(|&t| dot(q, self.vectors.vec(t as usize)))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Can `j` be handed out as a hint? It must be a familiar word, not a candidate, not
+    /// already played or banned, not of the same family as a candidate, and neither a
+    /// relative nor a near-duplicate of a word already revealed or picked for this rung.
+    fn hint_word_fits(&self, j: u32, targets: &[u32], seen: &[&[u32]]) -> bool {
+        let i = j as usize;
+        if i >= HINT_FAMILIAR_RANK || self.alive[i] || self.banned[i] {
+            return false;
+        }
+        if !is_plausible_word(&self.vectors.words[i]) || self.obs.iter().any(|o| o.idx == j) {
+            return false;
+        }
+        let w = &self.vectors.words[i];
+        if targets
+            .iter()
+            .any(|&t| shares_stem(w, &self.vectors.words[t as usize]))
+        {
+            return false;
+        }
+        !seen.iter().flat_map(|s| s.iter()).any(|&p| {
+            shares_stem(w, &self.vectors.words[p as usize])
+                || dot(
+                    self.vectors.vec(i),
+                    self.vectors.vec(p as usize),
+                ) > HINT_DIVERSITY
+        })
+    }
+
+    /// Words sitting at positions `lo..hi` of the shared neighbourhood of `targets`, with
+    /// everything [`Solver::hint_word_fits`] rejects skipped along the way. The frequency
+    /// cap is a walk filter, not a re-ranking: re-ranking inside the frequent subset
+    /// dilutes the wide band badly. A short band is widened rather than returned short.
+    pub fn hint_words(
+        &self,
+        targets: &[u32],
+        lo: usize,
+        hi: usize,
+        take: usize,
+        exclude: &[u32],
+    ) -> Vec<u32> {
+        let n = self.vectors.n();
+        if targets.is_empty() || take == 0 || n == 0 {
+            return Vec::new();
+        }
+        let mut scores = Vec::new();
+        self.hint_scores(targets, &mut scores);
+        // One sort of the whole lexicon, reused by every widening. Ties are broken by index
+        // so the ordering is a total one: the page freezes a revealed rung and re-renders
+        // it forever, and a selector that reordered ties would be a latent bug.
+        let cmp = |a: &u32, b: &u32| {
+            scores[*b as usize]
+                .total_cmp(&scores[*a as usize])
+                .then(a.cmp(b))
+        };
+        let mut picked: Vec<u32> = Vec::with_capacity(take);
+        let mut end = hi;
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_unstable_by(cmp);
+        for _ in 0..=HINT_WIDEN {
+            let k = end.min(n - 1);
+            let head = &order[..=k];
+            picked.clear();
+            for &j in &head[lo.min(head.len())..] {
+                if self.hint_word_fits(j, targets, &[exclude, &picked]) {
+                    picked.push(j);
+                    if picked.len() == take {
+                        return picked;
+                    }
+                }
+            }
+            if k + 1 >= n {
+                break;
+            }
+            end = end.saturating_mul(HINT_WIDEN);
+        }
+        picked
+    }
+
+    /// One rung of the ladder. Stateless: the caller owns the level counter, so a locked
+    /// answer costs the player nothing.
+    pub fn hint(&self, level: usize, revealed: &[u32]) -> Hint {
+        let Some(rung) = HintLevel::at(level) else {
+            return Hint::Locked(HintLocked::Ended);
+        };
+        if self.alive_count == 0 {
+            return Hint::Locked(HintLocked::NoCandidate);
+        }
+        let Some(targets) = self.hint_targets() else {
+            return Hint::Locked(HintLocked::TooMany {
+                alive: self.alive_count,
+            });
+        };
+        if self.hint_cohesion(&targets) < HINT_MIN_COHESION {
+            return Hint::Locked(HintLocked::Scattered {
+                alive: self.alive_count,
+            });
+        }
+        let (lo, hi, take) = rung.band();
+        let words = self.hint_words(&targets, lo, hi, take, revealed);
+        if words.is_empty() {
+            return Hint::Locked(HintLocked::Exhausted);
+        }
+        Hint::Words { level: rung, words }
+    }
+
+    /// Warmer or colder for one word: how well it fits every surviving candidate, next to
+    /// the best of the player's own guesses. `None` while the ladder is locked — the field
+    /// is then too wide for the comparison to mean anything.
+    pub fn warmth(&self, idx: u32) -> Option<Warmth> {
+        let targets = self.hint_targets()?;
+        if self.hint_cohesion(&targets) < HINT_MIN_COHESION {
+            return None;
+        }
+        let best = self
+            .obs
+            .iter()
+            .map(|o| (o.idx, self.fit_to(o.idx, &targets)))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        Some(Warmth {
+            fit: self.fit_to(idx, &targets),
+            best,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,5 +1487,185 @@ mod tests {
         }
         assert!(solver.alive[secret]);
         assert_eq!(solver.alive_count, 1);
+    }
+
+    // ── indices ──
+
+    #[test]
+    fn stem_filter_catches_morphological_relatives() {
+        // Pure strings, no model: these are the pairs that would hand the answer over.
+        assert!(shares_stem("blog", "blogueur"));
+        assert!(shares_stem("blog", "blogosphère"));
+        assert!(shares_stem("démonstration", "démontrer"));
+        assert!(shares_stem("oeuvre", "oeuvrer"));
+        assert!(shares_stem("Fantôme", "fantome"));
+        assert!(!shares_stem("fantôme", "zombie"));
+        assert!(!shares_stem("pilier", "poutre"));
+        assert!(!shares_stem("cactus", "bambou"));
+        // A short word inside a long one is not a family: « art » is not « partage ».
+        assert!(!shares_stem("art", "partage"));
+        assert_eq!(fold_accents("Démonstration"), "demonstration");
+        assert_eq!(fold_accents("cœur"), "coeur");
+    }
+
+    /// Drive the toy solver down to the single candidate `secret`, the way
+    /// `cosine_solver_still_trilaterates` does.
+    fn pinned(v: &Vectors, secret: usize) -> Solver<'_> {
+        let sims = v.dots(secret);
+        let mut solver = Solver::new(v);
+        for g in [3usize, 44, 300] {
+            solver.observe(Observation {
+                idx: g as u32,
+                score: round_scale(sims[g] as f64, SCALE_CEMANTIX),
+            });
+        }
+        assert_eq!(solver.alive_count, 1, "the fixture should pin one candidate");
+        solver
+    }
+
+    #[test]
+    fn hints_are_locked_while_the_field_is_wide_open() {
+        let v = toy(400, 16);
+        let s = Solver::new(&v);
+        assert!(matches!(
+            s.hint(0, &[]),
+            Hint::Locked(HintLocked::TooMany { .. })
+        ));
+        assert!(s.warmth(7).is_none());
+    }
+
+    #[test]
+    fn scattered_candidates_are_refused() {
+        let v = toy(400, 16);
+        let mut s = Solver::new(&v);
+        // Two nearly orthogonal words: no field is common to both.
+        let sims = v.dots(0);
+        let far = (1..400)
+            .min_by(|&a, &b| sims[a].abs().total_cmp(&sims[b].abs()))
+            .unwrap();
+        s.alive.iter_mut().for_each(|a| *a = false);
+        s.alive[0] = true;
+        s.alive[far] = true;
+        s.alive_count = 2;
+        assert!(s.hint_cohesion(&[0, far as u32]) < HINT_MIN_COHESION);
+        assert!(matches!(
+            s.hint(0, &[]),
+            Hint::Locked(HintLocked::Scattered { alive: 2 })
+        ));
+        assert!(s.warmth(5).is_none());
+    }
+
+    #[test]
+    fn the_ladder_ends() {
+        let v = toy(400, 16);
+        let s = pinned(&v, 77);
+        assert_eq!(HintLevel::LADDER.len(), 3);
+        assert_eq!(
+            s.hint(HintLevel::LADDER.len(), &[]),
+            Hint::Locked(HintLocked::Ended)
+        );
+    }
+
+    #[test]
+    fn hints_never_name_a_candidate_a_banned_or_a_played_word() {
+        let v = toy(400, 16);
+        let secret = 77usize;
+        let mut s = pinned(&v, secret);
+        s.ban(120);
+        let mut revealed: Vec<u32> = Vec::new();
+        for level in 0..HintLevel::LADDER.len() {
+            let Hint::Words { words, .. } = s.hint(level, &revealed) else {
+                panic!("rung {level} should be available on a pinned candidate");
+            };
+            for &w in &words {
+                let i = w as usize;
+                assert!(!s.alive[i], "a candidate was revealed");
+                assert_ne!(i, secret, "the secret was revealed");
+                assert!(!s.banned[i], "a banned word was revealed");
+                assert!(
+                    !s.obs.iter().any(|o| o.idx == w),
+                    "an already played word was revealed"
+                );
+                assert!(
+                    !revealed.contains(&w),
+                    "a word was handed out on two rungs"
+                );
+            }
+            revealed.extend(words);
+        }
+    }
+
+    #[test]
+    fn the_ladder_gets_closer_rung_by_rung() {
+        let v = toy(400, 16);
+        let secret = 77usize;
+        let s = pinned(&v, secret);
+        let mut revealed: Vec<u32> = Vec::new();
+        let mut fits = Vec::new();
+        for level in 0..HintLevel::LADDER.len() {
+            let Hint::Words { words, .. } = s.hint(level, &revealed) else {
+                panic!("rung {level} should be available");
+            };
+            let mean: f32 = words
+                .iter()
+                .map(|&w| dot(v.vec(w as usize), v.vec(secret)))
+                .sum::<f32>()
+                / words.len() as f32;
+            fits.push(mean);
+            revealed.extend(words);
+        }
+        assert!(
+            fits.windows(2).all(|p| p[1] > p[0]),
+            "each rung must sit closer to the secret than the last: {fits:?}"
+        );
+    }
+
+    #[test]
+    fn a_rung_does_not_repeat_itself() {
+        let v = toy(400, 16);
+        let s = pinned(&v, 77);
+        let Hint::Words { words, .. } = s.hint(0, &[]) else {
+            panic!("the wide rung should be available");
+        };
+        assert!(words.len() > 1);
+        for (k, &a) in words.iter().enumerate() {
+            for &b in &words[k + 1..] {
+                assert!(
+                    dot(v.vec(a as usize), v.vec(b as usize)) <= HINT_DIVERSITY,
+                    "two words of one rung say the same thing"
+                );
+                assert!(!shares_stem(&v.words[a as usize], &v.words[b as usize]));
+            }
+        }
+    }
+
+    #[test]
+    fn hints_are_deterministic() {
+        // The page freezes a revealed rung and re-renders it forever, so a selector that
+        // reordered ties would be a latent bug.
+        let v = toy(400, 16);
+        let s = pinned(&v, 77);
+        assert_eq!(s.hint(1, &[]), s.hint(1, &[]));
+    }
+
+    #[test]
+    fn a_short_band_is_widened_before_it_is_declared_exhausted() {
+        let v = toy(400, 16);
+        let s = pinned(&v, 77);
+        // A band with room for two words asked for six: widening must find them.
+        let words = s.hint_words(&[77], 2, 4, 6, &[]);
+        assert!(words.len() > 3, "the band was not widened ({words:?})");
+    }
+
+    #[test]
+    fn warmth_compares_against_the_players_own_best_guess() {
+        let v = toy(400, 16);
+        let secret = 77usize;
+        let s = pinned(&v, secret);
+        let w = s.warmth(secret as u32).expect("one candidate unlocks warmth");
+        assert!((w.fit - 1.0).abs() < 1e-5, "the secret fits itself");
+        let (best, best_fit) = w.best.expect("three words were played");
+        assert!(s.obs.iter().any(|o| o.idx == best));
+        assert!(best_fit < w.fit);
     }
 }

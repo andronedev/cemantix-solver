@@ -72,6 +72,36 @@ export class Engine {
         return ret !== 0;
     }
     /**
+     * One rung of the hint ladder, `revealed` being the words the earlier rungs already
+     * handed out. Stateless: the page owns the level counter, so a refusal costs the
+     * player nothing.
+     * @param {number} level
+     * @param {Uint32Array} revealed
+     * @returns {string}
+     */
+    hint(level, revealed) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ptr0 = passArray32ToWasm0(revealed, wasm.__wbindgen_malloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.engine_hint(this.__wbg_ptr, level, ptr0, len0);
+            deferred2_0 = ret[0];
+            deferred2_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * Number of rungs on the hint ladder.
+     * @returns {number}
+     */
+    hint_levels() {
+        const ret = wasm.engine_hint_levels(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * @param {string} word
      * @returns {number | undefined}
      */
@@ -226,6 +256,25 @@ export class Engine {
         let deferred1_1;
         try {
             const ret = wasm.engine_top(this.__wbg_ptr, k);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Warmer or colder for a word the player is typing: how well it fits the surviving
+     * candidates, against the best of their own guesses. Never says "candidate" — that
+     * would be a complete answer rather than a hint.
+     * @param {number} idx
+     * @returns {string}
+     */
+    warmth(idx) {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.engine_warmth(this.__wbg_ptr, idx);
             deferred1_0 = ret[0];
             deferred1_1 = ret[1];
             return getStringFromWasm0(ret[0], ret[1]);

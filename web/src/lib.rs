@@ -2,7 +2,8 @@
 //! one solver. Results are returned as JSON strings to keep the glue minimal.
 
 use cemantix_core::{
-    Observation, PRIOR_RANK, RankModel, RankTable, Scoring, Solver, Vectors, tol_level_for,
+    Hint, HintLevel, Observation, PRIOR_RANK, RankModel, RankTable, Scoring, Solver, Vectors,
+    tol_level_for,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -44,6 +45,36 @@ struct EvalOut {
     entropy: f64,
     buckets: usize,
     candidate: bool,
+}
+
+/// One rung of the hint ladder, flat so the page has nothing to unpack.
+#[derive(Serialize)]
+struct HintOut {
+    /// "words" when a rung was granted, "locked" otherwise.
+    kind: &'static str,
+    /// "field" | "tight" | "near", or the refusal:
+    /// "no_candidate" | "too_many" | "scattered" | "exhausted" | "ended".
+    rung: &'static str,
+    level: usize,
+    /// Rungs still obtainable after this call. A refusal consumes none.
+    remaining: usize,
+    words: Vec<String>,
+    /// The same words as indices, so the page can hand them back as `revealed`.
+    idx: Vec<u32>,
+    /// Surviving candidates, for the refusal messages.
+    alive: usize,
+}
+
+/// Warmer or colder for one word, without ever saying whether it is a candidate.
+#[derive(Serialize)]
+struct WarmthOut {
+    word: String,
+    /// How well the word fits every surviving candidate, null while the ladder is locked.
+    fit: Option<f32>,
+    /// The player's own guess that fits best, and its fit.
+    best: Option<String>,
+    best_fit: Option<f32>,
+    locked: bool,
 }
 
 #[wasm_bindgen]
@@ -246,6 +277,59 @@ impl Engine {
                 .iter()
                 .map(|&i| self.vectors.words[i as usize].clone())
                 .collect(),
+        };
+        serde_json::to_string(&out).unwrap()
+    }
+
+    /// Number of rungs on the hint ladder.
+    pub fn hint_levels(&self) -> usize {
+        HintLevel::LADDER.len()
+    }
+
+    /// One rung of the hint ladder, `revealed` being the words the earlier rungs already
+    /// handed out. Stateless: the page owns the level counter, so a refusal costs the
+    /// player nothing.
+    pub fn hint(&self, level: usize, revealed: &[u32]) -> String {
+        let total = HintLevel::LADDER.len();
+        let out = match self.solver.hint(level, revealed) {
+            Hint::Words { level: rung, words } => HintOut {
+                kind: "words",
+                rung: rung.name(),
+                level,
+                remaining: total.saturating_sub(level + 1),
+                words: words
+                    .iter()
+                    .map(|&i| self.vectors.words[i as usize].clone())
+                    .collect(),
+                idx: words,
+                alive: self.solver.alive_count,
+            },
+            Hint::Locked(why) => HintOut {
+                kind: "locked",
+                rung: why.name(),
+                level,
+                remaining: total.saturating_sub(level),
+                words: Vec::new(),
+                idx: Vec::new(),
+                alive: self.solver.alive_count,
+            },
+        };
+        serde_json::to_string(&out).unwrap()
+    }
+
+    /// Warmer or colder for a word the player is typing: how well it fits the surviving
+    /// candidates, against the best of their own guesses. Never says "candidate" — that
+    /// would be a complete answer rather than a hint.
+    pub fn warmth(&self, idx: u32) -> String {
+        let w = self.solver.warmth(idx);
+        let out = WarmthOut {
+            word: self.vectors.words[idx as usize].clone(),
+            fit: w.map(|w| w.fit),
+            best: w
+                .and_then(|w| w.best)
+                .map(|(i, _)| self.vectors.words[i as usize].clone()),
+            best_fit: w.and_then(|w| w.best).map(|(_, f)| f),
+            locked: w.is_none(),
         };
         serde_json::to_string(&out).unwrap()
     }

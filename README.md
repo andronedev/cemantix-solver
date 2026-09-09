@@ -103,6 +103,8 @@ cargo run --release -- play                 # joue la partie du jour
 cargo run --release -- play --choose        # vous choisissez le premier mot
 cargo run --release -- play --start soleil  # ou vous l'imposez
 cargo run --release -- sim -n 300           # banc offline, distribution du nombre de coups
+cargo run --release -- hints pilier cactus  # l'échelle d'indices pour ces mots
+cargo run --release -- hints --audit 300    # recalibrer les bandes d'indices
 ```
 
 Pour les jeux à rangs, il faut d'abord la table des voisins. Elle demande une passe 49 k × 49 k, une poignée de
@@ -125,9 +127,38 @@ Le CLI attend au moins 300 ms entre deux appels et n'en fait que trois ou quatre
 float16 (49 Mo, une fois, puis gardés dans le cache du navigateur) et, pour QuelMot, la table des rangs (1,8 Mo).
 Choisissez le jeu, jouez le mot proposé sur le site, reportez le score, recommencez. Vous pouvez jouer un autre mot
 que la proposition : la page vous dit combien de bits il apporte par rapport à elle. En mode QuelMot, le bouton
-« indice 🎁 » enregistre un mot offert par le site sans le compter comme un coup.
+« mot offert 🎁 » enregistre un mot donné par le site sans le compter comme un coup.
 
 Si l'export ne contient pas `ranks.f16`, l'onglet QuelMot reste désactivé et Cémantix fonctionne normalement.
+
+## Le mode Indices
+
+L'assistant connaît la réponse bien avant vous, ce qui est exactement ce qu'on ne veut pas quand on joue. Le second
+onglet, **Indices**, masque le mot proposé et la liste des candidats — la page n'affiche plus que leur nombre — et
+ajoute un bouton qui livre un palier de plus à chaque clic : le champ sémantique de loin, le champ de plus près,
+puis un mot très proche du secret qui n'est pas lui. Chaque palier révélé est figé, et un refus ne consomme rien.
+Pendant la saisie, la page dit si votre mot colle mieux ou moins bien au champ des candidats que votre meilleur
+essai — sans jamais dire s'il en est un, ce qui serait une réponse complète.
+
+Deux mesures sur le vrai modèle fixent la construction. D'abord, le barycentre des candidats n'est pas un objet
+sémantique : les candidats Cémantix forment la coquille des mots à un cosinus donné de l'opener, pas un amas, et
+leur moyenne a une norme de 0,19 avec le secret au rang 30 000. Un mot d'indice est donc noté par le **minimum**
+de ses cosinus à chaque candidat survivant, ce qui le rend vrai de tous par construction. Ensuite, aucun seuil de
+cosinus absolu n'est calibrable : le premier voisin d'un mot se situe entre 0,45 et 0,69 selon le mot. Les bandes
+sont donc des **positions** dans ce classement partagé :
+
+| palier | positions | mots | cosinus médian au secret |
+|---|---|---|---|
+| champ, de loin | 200–900 | 4 | 0,288 |
+| champ, de près | 25–120 | 3 | 0,392 |
+| mot très proche | 2–12 | 1 | 0,513 |
+
+Deux filtres sont indispensables. Le filtre de radical, sinon « blog » livre *blogueur* et « démonstration »
+livre *démontrer* ; et un plafond de fréquence à 20 000, sinon les bandes remontent *nallet*, *net-iris*, *ziki*.
+Enfin, aucun indice n'est donné tant que plus de huit candidats survivent, ni quand leur cosinus minimal deux à
+deux tombe sous 0,30 : `{méfier, intellectuellement, chipoter}` n'ont pas de champ commun, et un indice sur « le »
+champ serait un mensonge. En pratique Cémantix débloque l'échelle au deuxième score reporté ; QuelMot demande
+quelques coups de plus. `cargo run -- hints --audit N` remesure tout cela après un changement de modèle.
 
 Pour la reconstruire :
 
