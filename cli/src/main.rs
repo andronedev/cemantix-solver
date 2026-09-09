@@ -269,7 +269,10 @@ fn check_ranks(data: &Path, secret: &str, obs: &[String], opts: &GameOpts) -> Re
             println!("{w:<18} {score:>7}   absent du modèle");
             continue;
         };
-        let est = table.rank(i as usize, sims[i as usize]);
+        // The rank to compare is the guess's among the secret's neighbours, the very
+        // quantity the site scores: rank is not symmetric, the guess's own row answers
+        // the mirror question and is off by a factor of four here.
+        let est = table.rank(si, sims[i as usize]);
         let local = lex.binary_search(&i).ok().map(|k| ranks[k]);
         let (local_txt, est_txt) = (
             local
