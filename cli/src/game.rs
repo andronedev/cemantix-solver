@@ -1,41 +1,121 @@
 //! Game loop shared by the live player and the offline simulator.
 
 use crate::api::ScoreResp;
-use crate::events::{Event, emoji};
+use crate::events::{Event, emoji, emoji_rank};
 use crate::model::Model;
 use anyhow::{Result, bail};
-use cemantix_core::{Choice, Observation, Solver, partition_entropy, round_scale};
+use cemantix_core::{Choice, Observation, RankModel, Scoring, Solver, round_scale};
 use std::time::Instant;
 
 pub trait Oracle {
     fn score(&mut self, word: &str, idx: u32) -> Result<ScoreResp>;
 }
 
-/// Offline oracle reproducing the server's scoring from the local model.
+/// Offline oracle reproducing a server's scoring from the local model.
+///
+/// Cémantix is exact: the score *is* the local cosine. QuelMot is a simulation, since
+/// their lexicon is not ours: the local rank of the guess is multiplied by `alpha` (their
+/// lexicon is about 1.5× bigger) before being turned into a score, optionally with a
+/// relative `jitter` to model the fact that the two lexicons do not dilate uniformly.
 pub struct LocalOracle {
     pub secret: u32,
-    pub scale: f64,
+    pub scoring: Scoring,
     sims: Vec<f32>,
     thresh: f32,
+    /// Local rank of every word among the secret's neighbours, `u32::MAX` outside the
+    /// plausible lexicon. Only built for rank scoring.
+    rank_of: Vec<u32>,
+    alpha: f64,
+    jitter: f64,
+    seed: u64,
 }
 
 impl LocalOracle {
-    pub fn new(model: &Model, secret: u32, scale: f64) -> Self {
+    pub fn new(model: &Model, secret: u32, scoring: Scoring) -> Self {
+        Self::with_lexicon(model, secret, scoring, 0.0, 0)
+    }
+
+    /// `alpha` overrides the model's lexicon factor for the simulation (0 = keep it),
+    /// `jitter` is the relative noise added to each simulated rank.
+    pub fn with_lexicon(
+        model: &Model,
+        secret: u32,
+        scoring: Scoring,
+        jitter: f64,
+        seed: u64,
+    ) -> Self {
         let sims = model.dots(secret as usize);
         let mut sorted = sims.clone();
-        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+        sorted.sort_unstable_by(|a, b| b.total_cmp(a));
         let thresh = sorted[1000.min(sorted.len() - 1)];
+        let mut rank_of = Vec::new();
+        let mut alpha = 1.0;
+        if let Scoring::Rank(m) = scoring {
+            alpha = m.alpha;
+            let lex = model.plausible_indices();
+            let ranks = model.exact_ranks(secret as usize, &lex);
+            rank_of = vec![u32::MAX; model.n()];
+            for (k, &w) in lex.iter().enumerate() {
+                rank_of[w as usize] = ranks[k];
+            }
+        }
         LocalOracle {
             secret,
-            scale,
+            scoring,
             sims,
             thresh,
+            rank_of,
+            alpha,
+            jitter,
+            seed,
+        }
+    }
+
+    pub fn set_alpha(&mut self, alpha: f64) {
+        self.alpha = alpha;
+    }
+
+    /// Deterministic factor in [1 − jitter, 1 + jitter] for one (secret, guess) pair.
+    fn noise(&self, idx: u32) -> f64 {
+        if self.jitter <= 0.0 {
+            return 1.0;
+        }
+        let mut h = self.seed ^ ((self.secret as u64) << 32) ^ idx as u64;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        let u = (h >> 11) as f64 / (1u64 << 53) as f64;
+        1.0 + self.jitter * (2.0 * u - 1.0)
+    }
+
+    fn rank_score(&self, m: &RankModel, idx: u32) -> f64 {
+        if idx == self.secret {
+            return m.top;
+        }
+        match self.rank_of.get(idx as usize).copied() {
+            Some(r) if r != u32::MAX && r > 0 => {
+                let site = (self.alpha * r as f64 * self.noise(idx)).round();
+                (m.top - site).max(m.floor)
+            }
+            // outside the plausible lexicon: far enough that the score is floored
+            _ => m.floor,
         }
     }
 }
 
 impl Oracle for LocalOracle {
     fn score(&mut self, _word: &str, idx: u32) -> Result<ScoreResp> {
+        if let Scoring::Rank(m) = self.scoring {
+            return Ok(ScoreResp::Score {
+                s: self.rank_score(&m, idx),
+                p: None,
+                solvers: None,
+            });
+        }
+        let scale = match self.scoring {
+            Scoring::Cosine { scale } => scale,
+            Scoring::Rank(_) => unreachable!(),
+        };
         let s = self.sims[idx as usize];
         let p = if idx == self.secret {
             Some(1000)
@@ -52,7 +132,7 @@ impl Oracle for LocalOracle {
             None
         };
         Ok(ScoreResp::Score {
-            s: round_scale(s as f64, self.scale),
+            s: round_scale(s as f64, scale),
             p,
             solvers: None,
         })
@@ -65,17 +145,35 @@ pub struct GameResult {
     pub total_ms: u64,
 }
 
+/// How a score reads back to the player: degrees for Cémantix, the raw number and the
+/// rank it stands for in a rank game.
+fn score_text(scoring: Scoring, s: f64, p: Option<u32>) -> (String, &'static str) {
+    match scoring {
+        Scoring::Cosine { .. } => (format!("{:>7.2}°C", s * 100.0), emoji(s, p)),
+        Scoring::Rank(m) => {
+            let r = m.local_rank(s);
+            let text = match r {
+                Some(r) => format!("{s:>7} (rang ≈ {r:.0})"),
+                None => format!("{s:>7} (hors du top {:.0})", m.floor_rank()),
+            };
+            (text, emoji_rank(r))
+        }
+    }
+}
+
 pub fn print_event(ev: &Event) {
     match ev {
         Event::Init {
             day,
             mode,
+            game,
             plausible,
             opener,
             model,
         } => {
             println!(
-                "▶ {} (jour {}) — modèle {}, {} candidats plausibles, opener {}",
+                "▶ {} · {} (jour {}) — modèle {}, {} candidats plausibles, opener {}",
+                game,
                 mode,
                 day.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
                 model,
@@ -111,7 +209,8 @@ pub fn print_event(ev: &Event) {
             }
         }
         Event::Result {
-            score,
+            score_text,
+            emoji,
             percentile,
             alive_before,
             alive_after,
@@ -128,9 +227,9 @@ pub fn print_event(ev: &Event) {
                 .map(|v| format!(" · {v} joueurs ont trouvé"))
                 .unwrap_or_default();
             println!(
-                "    → {:>7.2}°C {}{}   candidats {} → {} ({filter_ms} ms){}{}",
-                score * 100.0,
-                emoji(*score, *percentile),
+                "    → {} {}{}   candidats {} → {} ({filter_ms} ms){}{}",
+                score_text,
+                emoji,
                 p,
                 alive_before,
                 alive_after,
@@ -159,16 +258,20 @@ pub fn print_event(ev: &Event) {
     }
 }
 
-/// Play one game. `forced` are guesses to play first (user-chosen openers), then the
-/// solver takes over. `emit` receives every event.
+/// Play one game. `forced` are guesses to play first (user-chosen openers, or the free
+/// 🎁 hints a rank game hands out), then the solver takes over. `emit` receives every
+/// event.
 pub fn play_game(
     model: &Model,
     oracle: &mut dyn Oracle,
-    scale: f64,
+    scoring: Scoring,
     forced: &[u32],
     emit: &mut dyn FnMut(&Event),
 ) -> Result<GameResult> {
-    let mut solver = Solver::with_scale(model, scale);
+    if scoring.is_rank() && model.ranks.is_none() {
+        bail!("ce jeu se joue aux rangs : lancez d'abord « build-ranks »");
+    }
+    let mut solver = Solver::with_scoring(model, scoring);
     let start = Instant::now();
     let mut n: u32 = 0;
     let mut unknown_streak = 0;
@@ -180,16 +283,14 @@ pub fn play_game(
         let t = Instant::now();
         let (ch, is_forced) = match forced.next() {
             Some(idx) => {
-                let cands = solver.candidates();
-                let (entropy, buckets) =
-                    partition_entropy(&model.vecs, model.dim, idx as usize, &cands, scale);
+                let (entropy, buckets) = solver.evaluate(idx);
                 (
                     Choice {
                         idx,
                         entropy,
                         buckets,
                         probes: 1,
-                        candidates: cands.len(),
+                        candidates: solver.alive_count,
                     },
                     true,
                 )
@@ -221,7 +322,7 @@ pub fn play_game(
             ScoreResp::Score { s, p, solvers } => {
                 unknown_streak = 0;
                 n += 1;
-                if p == Some(1000) || s >= 0.99995 {
+                if scoring.solved(s, p) {
                     let total_ms = start.elapsed().as_millis() as u64;
                     emit(&Event::Solved {
                         word: word.clone(),
@@ -245,13 +346,15 @@ pub fn play_game(
                     .iter()
                     .map(|&i| model.words[i as usize].clone())
                     .collect();
+                let (text, icon) = score_text(scoring, s, p);
                 emit(&Event::Result {
-                    score: s,
+                    score_text: text,
+                    emoji: icon,
                     percentile: p,
                     alive_before: info.before,
                     alive_after: info.after,
                     top,
-                    tol: solver.tol(),
+                    tol: solver.tol_label(),
                     restricted: solver.restricted,
                     relaxed: info.relaxed,
                     filter_ms,

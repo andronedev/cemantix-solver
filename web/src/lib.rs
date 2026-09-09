@@ -1,7 +1,9 @@
-//! WebAssembly bindings: an `Engine` holding the compact f16 model and one solver.
-//! Results are returned as JSON strings to keep the glue minimal.
+//! WebAssembly bindings: an `Engine` holding the compact f16 model, its rank table and
+//! one solver. Results are returned as JSON strings to keep the glue minimal.
 
-use cemantix_core::{Observation, PRIOR_RANK, SCALE_CEMANTIX, Solver, Vectors, tol_level_for};
+use cemantix_core::{
+    Observation, PRIOR_RANK, RankModel, RankTable, Scoring, Solver, Vectors, tol_level_for,
+};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -9,8 +11,10 @@ use wasm_bindgen::prelude::*;
 pub struct Engine {
     vectors: &'static Vectors,
     solver: Solver<'static>,
-    scale: f64,
+    scoring: Scoring,
+    rank_model: RankModel,
     model_error: f64,
+    game: String,
 }
 
 #[derive(Serialize)]
@@ -28,7 +32,7 @@ struct ObserveOut {
     before: usize,
     after: usize,
     relaxed: bool,
-    tol: f64,
+    tol: String,
     restricted: bool,
     top: Vec<String>,
 }
@@ -44,18 +48,28 @@ struct EvalOut {
 
 #[wasm_bindgen]
 impl Engine {
-    /// `f16` = little-endian half-precision rows, `words` = one word per line,
-    /// `opener` = precomputed first guess, `model_error` = max score error of the
-    /// compressed model (from meta.json), `scale` = the game's score rounding
-    /// (10 000 for Cémantix, 1 000 for QuelMot).
+    /// Build the engine from the pieces of `meta.json`, which the page has already
+    /// parsed. Deserialising it here instead would drag a JSON reader into the wasm and
+    /// nearly double it, for nine numbers and three strings.
+    ///
+    /// - `f16` / `words`: the compact model, little-endian half-precision rows and one
+    ///   word per line.
+    /// - `ranks` / `rank_levels`: the neighbour-quantile dump and the ranks it tabulates.
+    ///   Leave both empty to ship without the rank games.
+    /// - `rank_model`: `[alpha, window, slack, top, floor]`, empty for QuelMot's defaults.
     #[wasm_bindgen(constructor)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         f16: &[u8],
         words: &str,
         dim: usize,
         opener: Option<String>,
         model_error: f64,
-        scale: Option<f64>,
+        ranks: &[u8],
+        rank_levels: &[u32],
+        rank_opener: Option<String>,
+        rank_model: &[f64],
+        game: Option<String>,
     ) -> Result<Engine, JsError> {
         let words: Vec<String> = words.lines().map(str::to_owned).collect();
         if f16.len() != words.len() * dim * 2 {
@@ -67,37 +81,100 @@ impl Engine {
             )));
         }
         let mut v = Vectors::from_f16("web".into(), dim, words, f16, PRIOR_RANK);
-        v.opener = opener.and_then(|w| v.lookup(&w));
+        v.opener = opener.as_deref().and_then(|w| v.lookup(w));
+        v.rank_opener = rank_opener.as_deref().and_then(|w| v.lookup(w));
+        if !ranks.is_empty() && !rank_levels.is_empty() {
+            let lex = v.plausible_indices();
+            v.ranks = RankTable::from_f16(v.n(), &lex, rank_levels, ranks);
+            if v.ranks.is_none() {
+                return Err(JsError::new(&format!(
+                    "table de rangs incohérente : {} octets pour {} mots x {} niveaux",
+                    ranks.len(),
+                    lex.len(),
+                    rank_levels.len()
+                )));
+            }
+        }
+        let rank_model = match *rank_model {
+            [alpha, window, slack, top, floor] => RankModel {
+                alpha,
+                window,
+                slack,
+                top,
+                floor,
+            },
+            [] => RankModel::QUELMOT,
+            _ => return Err(JsError::new("rank_model attend 5 nombres")),
+        };
         let vectors: &'static Vectors = Box::leak(Box::new(v));
-        let scale = scale.unwrap_or(SCALE_CEMANTIX);
-        let mut solver = Solver::with_scale(vectors, scale);
-        solver.tol_level = tol_level_for(scale, model_error);
-        Ok(Engine {
+        let mut engine = Engine {
             vectors,
-            solver,
-            scale,
+            solver: Solver::new(vectors),
+            scoring: Scoring::CEMANTIX,
+            rank_model,
             model_error,
-        })
+            game: "cemantix".into(),
+        };
+        engine.set_game(game.as_deref().unwrap_or("cemantix"))?;
+        Ok(engine)
     }
 
-    /// Start a new game with the current scale.
+    /// Start a new game with the current scoring.
     pub fn reset(&mut self) {
-        self.solver = Solver::with_scale(self.vectors, self.scale);
-        self.solver.tol_level = tol_level_for(self.scale, self.model_error);
+        self.solver = Solver::with_scoring(self.vectors, self.scoring);
+        if let Scoring::Cosine { scale } = self.scoring {
+            self.solver.tol_level = tol_level_for(scale, self.model_error);
+        }
     }
 
-    /// Switch game (score rounding scale) and start a new game.
-    pub fn set_scale(&mut self, scale: f64) {
-        self.scale = scale;
+    /// Switch game and start over. Fails when the export shipped no rank table.
+    pub fn set_game(&mut self, game: &str) -> Result<(), JsError> {
+        let scoring = match game {
+            "cemantix" => Scoring::CEMANTIX,
+            "quelmot" => {
+                if self.vectors.ranks.is_none() {
+                    return Err(JsError::new(
+                        "ce jeu se joue aux rangs, or la table de rangs n'a pas été exportée",
+                    ));
+                }
+                Scoring::Rank(self.rank_model)
+            }
+            other => return Err(JsError::new(&format!("jeu inconnu « {other} »"))),
+        };
+        self.scoring = scoring;
+        self.game = game.to_string();
         self.reset();
+        Ok(())
     }
 
-    pub fn scale(&self) -> f64 {
-        self.scale
+    pub fn game(&self) -> String {
+        self.game.clone()
     }
 
-    pub fn tol(&self) -> f64 {
-        self.solver.tol()
+    /// Can the rank games be played with this export?
+    pub fn has_ranks(&self) -> bool {
+        self.vectors.ranks.is_some()
+    }
+
+    pub fn tol(&self) -> String {
+        self.solver.tol_label()
+    }
+
+    /// Local rank a rank-game score stands for, `None` on the floor or in a cosine game.
+    pub fn rank_for(&self, score: f64) -> Option<f64> {
+        match self.scoring {
+            Scoring::Rank(m) => m.local_rank(score),
+            Scoring::Cosine { .. } => None,
+        }
+    }
+
+    /// Rank past which a rank game floors its score, so all a floored answer says is
+    /// "further than this".
+    pub fn floor_rank(&self) -> Option<f64> {
+        match self.scoring {
+            Scoring::Rank(m) => Some(m.floor_rank()),
+            Scoring::Cosine { .. } => None,
+        }
     }
 
     pub fn n(&self) -> usize {
@@ -124,7 +201,7 @@ impl Engine {
         let mut ch = self.solver.next_guess();
         let opener = ch.entropy.is_nan();
         if opener {
-            // The opener is precomputed: measure its entropy at this game's scale.
+            // The opener is precomputed: measure what it is worth in this game.
             let (h, b) = self.solver.evaluate(ch.idx);
             ch.entropy = h;
             ch.buckets = b;
@@ -153,13 +230,15 @@ impl Engine {
         serde_json::to_string(&out).unwrap()
     }
 
+    /// Record one answer. `score` is what the site printed: a cosine for Cémantix, the
+    /// raw integer for a rank game. Free 🎁 hints go in here like any other guess.
     pub fn observe(&mut self, idx: u32, score: f64) -> String {
         let info = self.solver.observe(Observation { idx, score });
         let out = ObserveOut {
             before: info.before,
             after: info.after,
             relaxed: info.relaxed,
-            tol: self.solver.tol(),
+            tol: self.solver.tol_label(),
             restricted: self.solver.restricted,
             top: self
                 .solver
