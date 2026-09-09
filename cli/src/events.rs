@@ -5,6 +5,7 @@ pub enum Event {
     Init {
         day: Option<u32>,
         mode: String,
+        game: String,
         model: String,
         plausible: usize,
         opener: Option<String>,
@@ -24,12 +25,14 @@ pub enum Event {
         think_ms: u64,
     },
     Result {
-        score: f64,
+        /// The score, spelled out for a human: degrees for Cémantix, a rank elsewhere.
+        score_text: String,
+        emoji: &'static str,
         percentile: Option<u32>,
         alive_before: usize,
         alive_after: usize,
         top: Vec<String>,
-        tol: f64,
+        tol: String,
         restricted: bool,
         relaxed: bool,
         filter_ms: u64,
@@ -46,6 +49,7 @@ pub enum Event {
     },
 }
 
+/// Cémantix's own thermometer: the ‰ rank when the server gives one, else the sign.
 pub fn emoji(score: f64, p: Option<u32>) -> &'static str {
     match p {
         Some(1000) => "🥳",
@@ -55,5 +59,18 @@ pub fn emoji(score: f64, p: Option<u32>) -> &'static str {
         Some(_) => "😎",
         None if score > 0.0 => "🥶",
         None => "🧊",
+    }
+}
+
+/// Same idea for a rank game, where the score *is* a rank: the closer the guess sits to
+/// the secret, the hotter. `floored` marks the scores that only say "far away".
+pub fn emoji_rank(local_rank: Option<f64>) -> &'static str {
+    match local_rank {
+        None => "🧊",
+        Some(r) if r <= 3.0 => "😱",
+        Some(r) if r <= 10.0 => "🔥",
+        Some(r) if r <= 50.0 => "🥵",
+        Some(r) if r <= 200.0 => "😎",
+        Some(_) => "🥶",
     }
 }

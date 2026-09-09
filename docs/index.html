@@ -18,6 +18,7 @@ hr{border:0;border-top:1px solid var(--line);margin:32px 0}
 .games{display:flex;gap:16px;margin-top:20px;font-size:14px}
 .games button{background:none;border:0;padding:0 0 3px;color:var(--muted);border-bottom:2px solid transparent;border-radius:0}
 .games button[aria-pressed="true"]{color:var(--fg);border-bottom-color:var(--fg)}
+.games button[disabled]{opacity:.45;cursor:default}
 .turn{font-size:14px;color:var(--muted)}
 .prop{font-size:28px;font-weight:600;margin:2px 0 4px;letter-spacing:-.01em}
 form{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
@@ -79,6 +80,7 @@ footer a{color:var(--muted)}
       <button class="primary" id="ok" type="submit">Valider</button>
     </form>
     <div class="actions">
+      <button class="link" id="hint" type="button" hidden title="un mot 🎁 offert par le site : il compte comme une observation, pas comme un coup">indice 🎁</button>
       <button class="link" id="unknown" type="button">le site ne connaît pas ce mot</button>
       <button class="link" id="found" type="button">trouvé</button>
       <button class="link" id="reset" type="button">nouvelle partie</button>
@@ -92,15 +94,15 @@ footer a{color:var(--muted)}
 
   <section id="hist" hidden>
     <table>
-      <thead><tr><th>#</th><th>mot</th><th class="num" id="scorehead">°C</th><th></th><th class="num">‰</th><th class="num">restants</th></tr></thead>
+      <thead><tr><th>#</th><th>mot</th><th class="num" id="scorehead">°C</th><th></th><th class="num" id="sidehead">‰</th><th class="num">restants</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </section>
 
   <footer>
     <span id="foothint">Jouez sur cemantix.certitudes.org et reportez ici le °C obtenu.</span>
-    Chaque score est une contrainte exacte sur le mot secret ; la page garde les mots compatibles et propose
-    le plus informatif. Tout s'exécute dans le navigateur.
+    <span id="footwhy">Chaque score est une contrainte exacte sur le mot secret ; la page garde les mots compatibles et propose
+    le plus informatif.</span> Tout s'exécute dans le navigateur.
     <a href="https://github.com/andronedev/cemantix-solver">Code source</a>.
   </footer>
 </main>
@@ -112,35 +114,64 @@ const $ = id => document.getElementById(id);
 const fmtN = n => n.toLocaleString('fr-FR');
 const fmtB = b => b.toFixed(1).replace('.', ',');
 
-// Each game rounds the cosine differently; the solver is told the scale.
+// The two games do not answer the same question.
+//
+// Cémantix returns the cosine between your word and the secret, rounded to four
+// decimals: an exact equation, and three of them pin the word down.
+//
+// QuelMot returns a rank: 1000 − the position of your word among the secret's
+// neighbours, floored at −999. A word with no link scores −999 straight away and
+// teaches almost nothing, which is why the 🎁 hints are worth so much: they are
+// free observations at known ranks.
 const GAMES = {
   cemantix: {
-    name: 'Cémantix', site: 'cemantix.certitudes.org', scale: 10000,
-    placeholder: '°C', head: '°C', example: '8,89', min: -100, max: 100,
+    name: 'Cémantix', site: 'cemantix.certitudes.org', kind: 'cosine',
+    placeholder: '°C', head: '°C', side: '‰', example: '8,89', min: -100, max: 100,
+    permille: true, hints: false,
     parse: t => Math.round(t * 100) / 10000,
     fmt: s => (s * 100).toFixed(2).replace('.', ','),
     won: (s, p) => s >= 0.9999 || p === 1000,
     hint: 'Jouez sur cemantix.certitudes.org et reportez ici le °C obtenu.',
+    why: 'Chaque score est une contrainte exacte sur le mot secret ; la page garde les mots compatibles et propose le plus informatif.',
   },
   quelmot: {
-    name: 'QuelMot', site: 'quelmot.fr', scale: 1000,
-    placeholder: 'score', head: 'score', example: '89', min: -1000, max: 1000,
-    parse: t => Math.round(t) / 1000,
-    fmt: s => String(Math.round(s * 1000)),
-    won: (s, p) => Math.round(s * 1000) >= 1000 || p === 1000,
-    hint: 'Jouez sur quelmot.fr et reportez ici le score obtenu (entier entre -1000 et 1000).',
+    name: 'QuelMot', site: 'quelmot.fr', kind: 'rank',
+    placeholder: 'score', head: 'score', side: 'rang', example: '399', min: -999, max: 1000,
+    permille: false, hints: true,
+    parse: t => Math.round(t),
+    fmt: s => String(Math.round(s)),
+    won: s => Math.round(s) >= 1000,
+    hint: 'Jouez sur quelmot.fr et reportez ici le score obtenu (entier entre -999 et 1000), indices 🎁 compris.',
+    why: 'Le score de QuelMot est un rang, pas une température : 1000 moins la place de votre mot parmi les voisins du secret. Chaque réponse enferme le secret dans une bande de rangs ; un mot sans lien tombe à −999 et n’apprend presque rien, alors que les indices 🎁 valent chacun un coup.',
   },
 };
 let game = GAMES.cemantix;
 const fmtC = s => game.fmt(s);
+
 function emoji(s, p) {
+  if (game.kind === 'rank') {
+    if (game.won(s)) return '🥳';
+    const r = engine.rank_for(s);
+    if (r == null) return '🧊';
+    return r <= 3 ? '😱' : r <= 10 ? '🔥' : r <= 50 ? '🥵' : r <= 200 ? '😎' : '🥶';
+  }
   if (p === 1000) return '🥳';
   if (p != null) return p >= 999 ? '😱' : p >= 990 ? '🔥' : p >= 900 ? '🥵' : '😎';
   return s > 0 ? '🥶' : '🧊';
 }
 
+// What the score says about the secret, in the game's own terms: the ‰ rank Cémantix
+// prints, or the local rank a QuelMot score stands for.
+function sideValue(g) {
+  if (game.kind !== 'rank') return g.p ?? '';
+  const r = engine.rank_for(g.score);
+  if (r != null) return Math.round(r);
+  const f = engine.floor_rank();
+  return f == null ? '' : '> ' + fmtN(Math.round(f));
+}
+
 let engine = null, meta = null, N = 0;
-const st = { n: 1, history: [], proposal: null, solved: null };
+const st = { n: 1, history: [], proposal: null, solved: null, busy: false };
 
 async function loadAsset(url, onProgress) {
   let cache = null;
@@ -193,9 +224,10 @@ function renderHistory() {
     const tr = document.createElement('tr');
     if (g.unknown) tr.className = 'unknown';
     if (g.win) tr.className = 'win';
-    const cells = g.unknown ? [g.n, g.word, '', 'inconnu', '', '']
-      : g.win ? [g.n, g.word, fmtC(1), '🥳', '1000', '1']
-      : [g.n, g.word, fmtC(g.score), emoji(g.score, g.p), g.p ?? '', fmtN(g.after)];
+    const label = g.hint ? '🎁' : g.n;
+    const cells = g.unknown ? [label, g.word, '', 'inconnu', '', '']
+      : g.win ? [label, g.word, fmtC(game.kind === 'rank' ? 1000 : 1), '🥳', game.kind === 'rank' ? '1' : '1000', '1']
+      : [label, g.word, fmtC(g.score), emoji(g.score, g.p), sideValue(g), fmtN(g.after)];
     cells.forEach((c, i) => {
       const td = document.createElement('td');
       if (i === 2 || i === 4 || i === 5) td.className = 'num';
@@ -208,15 +240,30 @@ function renderHistory() {
   $('hist').hidden = st.history.length === 0;
 }
 
+function setBusy(b) {
+  st.busy = b;
+  const off = b || !!st.solved;
+  for (const id of ['ok', 'unknown', 'found', 'hint']) $(id).disabled = off;
+}
+
+// Choosing a guess can take a moment on a rank game, where the whole lexicon is still
+// in play: paint the waiting state before doing the work.
 function propose() {
-  st.proposal = JSON.parse(engine.next_guess());
-  const p = st.proposal;
+  st.proposal = null;
   $('turn').textContent = `Coup ${st.n}`;
-  $('prop').textContent = p.word;
-  $('propinfo').textContent = p.candidates === 1 ? `Dernier candidat compatible avec tous vos scores.`
-    : `${p.opener ? 'Premier mot précalculé : ' : ''}${fmtB(p.entropy)} bits attendus, ${fmtN(p.buckets)} réponses possibles parmi ${fmtN(p.candidates)} candidats.`;
-  $('word').value = p.word; $('temp').value = ''; $('perm').value = '';
-  $('temp').focus();
+  $('prop').textContent = '…';
+  $('propinfo').textContent = 'recherche du mot le plus informatif…';
+  setBusy(true);
+  setTimeout(() => {
+    const p = JSON.parse(engine.next_guess());
+    st.proposal = p;
+    $('prop').textContent = p.word;
+    $('propinfo').textContent = p.candidates === 1 ? 'Dernier candidat compatible avec tous vos scores.'
+      : `${p.opener ? 'Premier mot précalculé : ' : ''}${fmtB(p.entropy)} bits attendus, ${fmtN(p.buckets)} réponses possibles parmi ${fmtN(p.candidates)} candidats.`;
+    $('word').value = p.word; $('temp').value = ''; $('perm').value = '';
+    setBusy(false);
+    $('temp').focus();
+  }, 16);
 }
 
 function parseTemp(s) {
@@ -228,7 +275,7 @@ function parseTemp(s) {
 function currentIdx() {
   const w = $('word').value.trim().toLowerCase();
   if (!w) return null;
-  if (w === st.proposal.word) return st.proposal.idx;
+  if (st.proposal && w === st.proposal.word) return st.proposal.idx;
   const idx = engine.lookup(w);
   return idx == null ? null : idx;
 }
@@ -238,7 +285,7 @@ function onWordInput() {
   clearTimeout(evalTimer);
   evalTimer = setTimeout(() => {
     const w = $('word').value.trim().toLowerCase();
-    if (!w || w === st.proposal.word) { setMsg(''); return; }
+    if (!w || !st.proposal || w === st.proposal.word) { setMsg(''); return; }
     const idx = engine.lookup(w);
     if (idx == null) { setMsg(`« ${w} » est absent du modèle. Le site n'accepte que les singuliers et les infinitifs.`, 'err'); return; }
     const ev = JSON.parse(engine.evaluate(idx));
@@ -247,19 +294,22 @@ function onWordInput() {
   }, 200);
 }
 
-function validate() {
-  if (st.solved) return;
+/// Feed one answer to the solver. A hint is an observation like any other, it just does
+/// not cost a turn.
+function record(hint) {
+  if (st.solved || st.busy) return;
   const idx = currentIdx();
   const w = $('word').value.trim().toLowerCase();
   if (idx == null) { setMsg(`« ${w} » est absent du modèle.`, 'err'); return; }
   const t = parseTemp($('temp').value);
   if (isNaN(t) || t < game.min || t > game.max) { setMsg(`Indiquez le ${game.placeholder} affiché par ${game.site}, par exemple ${game.example}.`, 'err'); $('temp').focus(); return; }
-  const p = $('perm').value.trim() ? parseInt($('perm').value, 10) : null;
+  const p = game.permille && $('perm').value.trim() ? parseInt($('perm').value, 10) : null;
   const score = game.parse(t);
   if (game.won(score, p)) { win(w); return; }
+  const you = !st.proposal || w !== st.proposal.word;
   const res = JSON.parse(engine.observe(idx, score));
-  st.history.push({ n: st.n, word: w, score, p, after: res.after, you: w !== st.proposal.word });
-  st.n++;
+  st.history.push({ n: st.n, word: w, score, p, after: res.after, you, hint });
+  if (!hint) st.n++;
   renderHistory(); renderCands(res.top);
   if (res.after === 0) setMsg('Plus aucun mot compatible, même en élargissant. Vérifiez les scores saisis.', 'err');
   else if (res.relaxed) setMsg(`Scores légèrement incohérents : tolérance élargie à ${res.tol}. Vérifiez la saisie.`);
@@ -268,7 +318,7 @@ function validate() {
 }
 
 function unknown() {
-  if (st.solved) return;
+  if (st.solved || st.busy) return;
   const idx = currentIdx();
   const w = $('word').value.trim().toLowerCase();
   if (idx == null) { setMsg(`« ${w} » est absent du modèle.`, 'err'); return; }
@@ -288,32 +338,42 @@ function win(w) {
   $('turn').textContent = 'Terminé';
   $('prop').textContent = w; $('propinfo').textContent = '';
   setMsg(`Trouvé en ${st.n} coup${st.n > 1 ? 's' : ''}.`, 'win');
-  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found']) $(id).disabled = true;
+  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found', 'hint']) $(id).disabled = true;
 }
 
-function setGame(key, first) {
-  game = GAMES[key] || GAMES.cemantix;
+function setGame(key) {
+  if (!GAMES[key]) key = 'cemantix';
+  if (engine) {
+    try { engine.set_game(key); }
+    catch (e) { setMsg(e && e.message ? e.message : String(e), 'err'); return; }
+  }
+  game = GAMES[key];
   for (const b of document.querySelectorAll('#games button')) b.setAttribute('aria-pressed', String(b.dataset.game === key));
   $('temp').placeholder = game.placeholder;
   $('scorehead').textContent = game.head;
+  $('sidehead').textContent = game.side;
+  $('perm').hidden = !game.permille;
+  $('hint').hidden = !game.hints;
   $('foothint').textContent = game.hint;
+  $('footwhy').textContent = game.why;
   try { localStorage.setItem('assistant-game', key); } catch (_) {}
-  if (!first) { engine.set_scale(game.scale); reset(); }
+  if (engine) reset();
 }
 
 function reset() {
   engine.reset();
   st.n = 1; st.history = []; st.solved = null;
-  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found']) $(id).disabled = false;
+  for (const id of ['word', 'temp', 'perm', 'ok', 'unknown', 'found', 'hint']) $(id).disabled = false;
   $('cands').hidden = false;
   renderHistory(); renderCands(); setMsg(''); propose();
 }
 
-$('playform').addEventListener('submit', e => { e.preventDefault(); validate(); });
+$('playform').addEventListener('submit', e => { e.preventDefault(); record(false); });
+$('hint').onclick = () => record(true);
 $('unknown').onclick = unknown;
 $('found').onclick = () => { if (st.solved) return; const w = $('word').value.trim().toLowerCase(); if (currentIdx() != null) win(w); else setMsg(`« ${w} » est absent du modèle.`, 'err'); };
 $('reset').onclick = reset;
-for (const b of document.querySelectorAll('#games button')) b.onclick = () => { if (!engine || b.getAttribute('aria-pressed') === 'true') return; setGame(b.dataset.game, false); };
+for (const b of document.querySelectorAll('#games button')) b.onclick = () => { if (!engine || b.disabled || b.getAttribute('aria-pressed') === 'true') return; setGame(b.dataset.game); };
 $('word').addEventListener('input', onWordInput);
 
 (async () => {
@@ -327,14 +387,32 @@ $('word').addEventListener('input', onWordInput);
       $('loadbar').style.width = pct + '%';
       $('loadmsg').textContent = `Téléchargement du modèle, ${(got / 1e6).toFixed(0)}${total ? ` / ${(total / 1e6).toFixed(0)}` : ''} Mo`;
     }));
+    // The rank table is small and only the rank games need it; without it QuelMot stays
+    // out of reach and its tab is disabled.
+    let ranks = new Uint8Array(0);
+    if (meta.ranks) {
+      $('loadmsg').textContent = 'Téléchargement de la table de rangs';
+      ranks = new Uint8Array(await loadAsset(meta.ranks));
+    }
     $('loadbar').style.width = '100%'; $('loadmsg').textContent = 'Décodage des vecteurs';
     await new Promise(r => setTimeout(r, 30));
     let key = 'cemantix';
     try { key = localStorage.getItem('assistant-game') || key; } catch (_) {}
     if (!GAMES[key]) key = 'cemantix';
-    setGame(key, true);
-    engine = new Engine(f16, words, meta.dim, meta.opener ?? undefined, meta.f16_max_score_error ?? 0, GAMES[key].scale);
+    if (key !== 'cemantix' && !meta.ranks) key = 'cemantix';
+    const q = meta.quelmot;
+    engine = new Engine(
+      f16, words, meta.dim, meta.opener ?? undefined, meta.f16_max_score_error ?? 0,
+      ranks, meta.rank_levels ?? [], meta.opener_rank ?? undefined,
+      q ? [q.alpha, q.window, q.slack, q.top, q.floor] : [], key);
     N = engine.n();
+    for (const b of document.querySelectorAll('#games button')) {
+      if (GAMES[b.dataset.game].kind === 'rank' && !engine.has_ranks()) {
+        b.disabled = true;
+        b.title = 'table de rangs absente de cet export (cargo run -- build-ranks puis export-web)';
+      }
+    }
+    setGame(key);
     $('sub').textContent = `${fmtN(N)} mots, ${meta.dim} dimensions, modèle ${meta.model}.`;
     $('loading').hidden = true;
     for (const id of ['play', 'cands', 'games']) $(id).hidden = false;

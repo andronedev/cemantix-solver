@@ -40,6 +40,38 @@ export class Engine {
         }
     }
     /**
+     * Rank past which a rank game floors its score, so all a floored answer says is
+     * "further than this".
+     * @returns {number | undefined}
+     */
+    floor_rank() {
+        const ret = wasm.engine_floor_rank(this.__wbg_ptr);
+        return ret[0] === 0 ? undefined : ret[1];
+    }
+    /**
+     * @returns {string}
+     */
+    game() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.engine_game(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Can the rank games be played with this export?
+     * @returns {boolean}
+     */
+    has_ranks() {
+        const ret = wasm.engine_has_ranks(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
      * @param {string} word
      * @returns {number | undefined}
      */
@@ -57,25 +89,44 @@ export class Engine {
         return ret >>> 0;
     }
     /**
-     * `f16` = little-endian half-precision rows, `words` = one word per line,
-     * `opener` = precomputed first guess, `model_error` = max score error of the
-     * compressed model (from meta.json), `scale` = the game's score rounding
-     * (10 000 for Cémantix, 1 000 for QuelMot).
+     * Build the engine from the pieces of `meta.json`, which the page has already
+     * parsed. Deserialising it here instead would drag a JSON reader into the wasm and
+     * nearly double it, for nine numbers and three strings.
+     *
+     * - `f16` / `words`: the compact model, little-endian half-precision rows and one
+     *   word per line.
+     * - `ranks` / `rank_levels`: the neighbour-quantile dump and the ranks it tabulates.
+     *   Leave both empty to ship without the rank games.
+     * - `rank_model`: `[alpha, window, slack, top, floor]`, empty for QuelMot's defaults.
      * @param {Uint8Array} f16
      * @param {string} words
      * @param {number} dim
      * @param {string | null | undefined} opener
      * @param {number} model_error
-     * @param {number | null} [scale]
+     * @param {Uint8Array} ranks
+     * @param {Uint32Array} rank_levels
+     * @param {string | null | undefined} rank_opener
+     * @param {Float64Array} rank_model
+     * @param {string | null} [game]
      */
-    constructor(f16, words, dim, opener, model_error, scale) {
+    constructor(f16, words, dim, opener, model_error, ranks, rank_levels, rank_opener, rank_model, game) {
         const ptr0 = passArray8ToWasm0(f16, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(words, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
         var ptr2 = isLikeNone(opener) ? 0 : passStringToWasm0(opener, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         var len2 = WASM_VECTOR_LEN;
-        const ret = wasm.engine_new(ptr0, len0, ptr1, len1, dim, ptr2, len2, model_error, !isLikeNone(scale), isLikeNone(scale) ? 0 : scale);
+        const ptr3 = passArray8ToWasm0(ranks, wasm.__wbindgen_malloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passArray32ToWasm0(rank_levels, wasm.__wbindgen_malloc);
+        const len4 = WASM_VECTOR_LEN;
+        var ptr5 = isLikeNone(rank_opener) ? 0 : passStringToWasm0(rank_opener, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len5 = WASM_VECTOR_LEN;
+        const ptr6 = passArrayF64ToWasm0(rank_model, wasm.__wbindgen_malloc);
+        const len6 = WASM_VECTOR_LEN;
+        var ptr7 = isLikeNone(game) ? 0 : passStringToWasm0(game, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len7 = WASM_VECTOR_LEN;
+        const ret = wasm.engine_new(ptr0, len0, ptr1, len1, dim, ptr2, len2, model_error, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -99,6 +150,8 @@ export class Engine {
         }
     }
     /**
+     * Record one answer. `score` is what the site printed: a cosine for Cémantix, the
+     * raw integer for a rank game. Free 🎁 hints go in here like any other guess.
      * @param {number} idx
      * @param {number} score
      * @returns {string}
@@ -123,31 +176,46 @@ export class Engine {
         return ret >>> 0;
     }
     /**
-     * Start a new game with the current scale.
+     * Local rank a rank-game score stands for, `None` on the floor or in a cosine game.
+     * @param {number} score
+     * @returns {number | undefined}
+     */
+    rank_for(score) {
+        const ret = wasm.engine_rank_for(this.__wbg_ptr, score);
+        return ret[0] === 0 ? undefined : ret[1];
+    }
+    /**
+     * Start a new game with the current scoring.
      */
     reset() {
         wasm.engine_reset(this.__wbg_ptr);
     }
     /**
-     * @returns {number}
+     * Switch game and start over. Fails when the export shipped no rank table.
+     * @param {string} game
      */
-    scale() {
-        const ret = wasm.engine_scale(this.__wbg_ptr);
-        return ret;
+    set_game(game) {
+        const ptr0 = passStringToWasm0(game, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.engine_set_game(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
     }
     /**
-     * Switch game (score rounding scale) and start a new game.
-     * @param {number} scale
-     */
-    set_scale(scale) {
-        wasm.engine_set_scale(this.__wbg_ptr, scale);
-    }
-    /**
-     * @returns {number}
+     * @returns {string}
      */
     tol() {
-        const ret = wasm.engine_tol(this.__wbg_ptr);
-        return ret;
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.engine_tol(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
      * @param {number} k
@@ -213,8 +281,24 @@ const EngineFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_engine_free(ptr, 1));
 
+let cachedFloat64ArrayMemory0 = null;
+function getFloat64ArrayMemory0() {
+    if (cachedFloat64ArrayMemory0 === null || cachedFloat64ArrayMemory0.byteLength === 0) {
+        cachedFloat64ArrayMemory0 = new Float64Array(wasm.memory.buffer);
+    }
+    return cachedFloat64ArrayMemory0;
+}
+
 function getStringFromWasm0(ptr, len) {
     return decodeText(ptr >>> 0, len);
+}
+
+let cachedUint32ArrayMemory0 = null;
+function getUint32ArrayMemory0() {
+    if (cachedUint32ArrayMemory0 === null || cachedUint32ArrayMemory0.byteLength === 0) {
+        cachedUint32ArrayMemory0 = new Uint32Array(wasm.memory.buffer);
+    }
+    return cachedUint32ArrayMemory0;
 }
 
 let cachedUint8ArrayMemory0 = null;
@@ -229,9 +313,23 @@ function isLikeNone(x) {
     return x === undefined || x === null;
 }
 
+function passArray32ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 4, 4) >>> 0;
+    getUint32ArrayMemory0().set(arg, ptr / 4);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
+
 function passArray8ToWasm0(arg, malloc) {
     const ptr = malloc(arg.length * 1, 1) >>> 0;
     getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
+
+function passArrayF64ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 8, 8) >>> 0;
+    getFloat64ArrayMemory0().set(arg, ptr / 8);
     WASM_VECTOR_LEN = arg.length;
     return ptr;
 }
@@ -313,6 +411,8 @@ function __wbg_finalize_init(instance, module) {
     wasmInstance = instance;
     wasm = instance.exports;
     wasmModule = module;
+    cachedFloat64ArrayMemory0 = null;
+    cachedUint32ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     wasm.__wbindgen_start();
     return wasm;

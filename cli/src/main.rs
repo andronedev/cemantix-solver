@@ -3,8 +3,8 @@ mod events;
 mod game;
 mod model;
 
-use anyhow::{Context, Result};
-use cemantix_core::{SCALE_CEMANTIX, SCALE_QUELMOT};
+use anyhow::{Context, Result, bail};
+use cemantix_core::{RankModel, Scoring};
 use clap::{Parser, Subcommand};
 use events::Event;
 use game::{LocalOracle, Oracle, play_game, print_event};
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(
     name = "cemantix",
-    about = "Solver Cémantix : trilatération dans l'espace word2vec"
+    about = "Solver Cémantix / QuelMot : trilatération et contraintes de rang dans l'espace word2vec"
 )]
 struct Cli {
     /// Data directory (model + caches)
@@ -24,6 +24,45 @@ struct Cli {
     data: PathBuf,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// How the chosen game scores a guess.
+#[derive(Clone, clap::Args)]
+struct GameOpts {
+    /// cemantix (cosinus à 4 décimales) ou quelmot (score = 1000 − rang)
+    #[arg(long, default_value = "cemantix")]
+    game: String,
+    /// Rapport entre le lexique du site et le nôtre (jeux à rangs)
+    #[arg(long)]
+    alpha: Option<f64>,
+    /// Demi-largeur multiplicative de la fenêtre de rangs acceptée
+    #[arg(long)]
+    window: Option<f64>,
+}
+
+impl GameOpts {
+    fn scoring(&self) -> Result<Scoring> {
+        match self.game.as_str() {
+            "cemantix" => Ok(Scoring::CEMANTIX),
+            "quelmot" => {
+                let mut m = RankModel::QUELMOT;
+                if let Some(a) = self.alpha {
+                    if a <= 0.0 {
+                        bail!("--alpha doit être > 0");
+                    }
+                    m.alpha = a;
+                }
+                if let Some(w) = self.window {
+                    if w <= 1.0 {
+                        bail!("--window doit être > 1");
+                    }
+                    m.window = w;
+                }
+                Ok(Scoring::Rank(m))
+            }
+            other => bail!("jeu inconnu « {other} » (cemantix ou quelmot)"),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -36,8 +75,24 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Tabulate the neighbour ranks of every plausible word (needed by QuelMot)
+    BuildRanks {
+        #[arg(long)]
+        force: bool,
+    },
     /// Check that the local model reproduces the server's scores (uses yesterday's word)
     Verify,
+    /// Check the rank model against real QuelMot answers, once the day's word is known
+    CheckRanks {
+        /// The secret of that day
+        #[arg(long)]
+        secret: String,
+        /// Repeatable: --obs mot=score, the scores the site gave (hints included)
+        #[arg(long = "obs", value_name = "MOT=SCORE", required = true)]
+        obs: Vec<String>,
+        #[command(flatten)]
+        opts: GameOpts,
+    },
     /// Export the plausible words as float16 + metadata for the web page (docs/)
     ExportWeb {
         #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs"))]
@@ -52,9 +107,14 @@ enum Cmd {
         /// Secrets are drawn among plausible words with frequency rank below this
         #[arg(long, default_value_t = 30000)]
         prior: usize,
-        /// Score rounding of the simulated game: cemantix (4 decimals) or quelmot (integer /1000)
-        #[arg(long, default_value = "cemantix")]
-        game: String,
+        #[command(flatten)]
+        opts: GameOpts,
+        /// Lexicon factor used by the simulated site (defaults to --alpha)
+        #[arg(long)]
+        sim_alpha: Option<f64>,
+        /// Relative noise on each simulated rank: the two lexicons do not dilate evenly
+        #[arg(long, default_value_t = 0.0)]
+        jitter: f64,
         #[arg(short, long)]
         verbose: bool,
     },
@@ -75,6 +135,8 @@ enum Cmd {
         /// Minimum delay between two API calls in ms
         #[arg(long, default_value_t = 300)]
         delay: u64,
+        #[command(flatten)]
+        opts: GameOpts,
     },
 }
 
@@ -101,22 +163,27 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::FetchModel { model: name, force } => model::build(&cli.data, &name, force),
+        Cmd::BuildRanks { force } => model::build_ranks(&cli.data, force),
         Cmd::Verify => verify(&cli.data),
+        Cmd::CheckRanks { secret, obs, opts } => check_ranks(&cli.data, &secret, &obs, &opts),
         Cmd::ExportWeb { out } => model::export_web(&cli.data, &out),
         Cmd::Sim {
             n,
             seed,
             prior,
-            game,
+            opts,
+            sim_alpha,
+            jitter,
             verbose,
-        } => sim(&cli.data, n, seed, prior, &game, verbose),
+        } => sim(&cli.data, n, seed, prior, &opts, sim_alpha, jitter, verbose),
         Cmd::Play {
             day,
             dry_run,
             start,
             choose,
             delay,
-        } => play(&cli.data, day, dry_run, start, choose, delay),
+            opts,
+        } => play(&cli.data, day, dry_run, start, choose, delay, &opts),
     }
 }
 
@@ -160,23 +227,140 @@ fn verify(data: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sim(data: &Path, n: usize, seed: u64, prior: usize, game: &str, verbose: bool) -> Result<()> {
-    let scale = match game {
-        "cemantix" => SCALE_CEMANTIX,
-        "quelmot" => SCALE_QUELMOT,
-        other => anyhow::bail!("jeu inconnu « {other} » (cemantix ou quelmot)"),
+/// Replay real answers against a known secret: does `site rank ≈ alpha × local rank`
+/// still hold, and does the tabulated estimate match the counted rank?
+fn check_ranks(data: &Path, secret: &str, obs: &[String], opts: &GameOpts) -> Result<()> {
+    let m = match opts.scoring()? {
+        Scoring::Rank(m) => m,
+        Scoring::Cosine { .. } => {
+            bail!("check-ranks ne concerne que les jeux à rangs (--game quelmot)")
+        }
     };
+    let model = model::load(data)?;
+    let table = model
+        .ranks
+        .as_ref()
+        .context("table de rangs absente : lancez d'abord « build-ranks »")?;
+    let secret = secret.trim().to_lowercase();
+    let si = model
+        .lookup(&secret)
+        .with_context(|| format!("« {secret} » est absent du modèle"))? as usize;
+    let lex = model.plausible_indices();
+    let ranks = model.exact_ranks(si, &lex);
+    let sims = model.dots(si);
+
+    println!(
+        "secret « {secret} », lexique local de {} mots, α attendu {:.2}",
+        lex.len(),
+        m.alpha
+    );
+    println!(
+        "{:<18} {:>7} {:>10} {:>11} {:>10} {:>7}",
+        "mot", "score", "rang site", "rang local", "estimé", "α"
+    );
+    let mut alphas: Vec<f64> = Vec::new();
+    for spec in obs {
+        let (w, s) = spec
+            .split_once('=')
+            .with_context(|| format!("attendu mot=score, reçu « {spec} »"))?;
+        let w = w.trim().to_lowercase();
+        let score: f64 = s.trim().parse().with_context(|| format!("score « {s} »"))?;
+        let Some(i) = model.lookup(&w) else {
+            println!("{w:<18} {score:>7}   absent du modèle");
+            continue;
+        };
+        let est = table.rank(i as usize, sims[i as usize]);
+        let local = lex.binary_search(&i).ok().map(|k| ranks[k]);
+        let (local_txt, est_txt) = (
+            local
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "hors lexique".into()),
+            est.map(|r| format!("{r:.0}")).unwrap_or_else(|| "—".into()),
+        );
+        match (m.local_rank(score), local) {
+            (Some(_), Some(r)) if r > 0 => {
+                let a = (m.top - score) / r as f64;
+                alphas.push(a);
+                println!(
+                    "{w:<18} {score:>7} {:>10.0} {local_txt:>11} {est_txt:>10} {a:>7.2}",
+                    m.top - score
+                );
+            }
+            (Some(_), _) => println!(
+                "{w:<18} {score:>7} {:>10.0} {local_txt:>11} {est_txt:>10} {:>7}",
+                m.top - score,
+                "?"
+            ),
+            (None, _) => println!(
+                "{w:<18} {score:>7} {:>10} {local_txt:>11} {est_txt:>10} {:>7}",
+                "plafonné", "—"
+            ),
+        }
+    }
+    if alphas.is_empty() {
+        println!("\naucun score non plafonné : rien à ajuster");
+        return Ok(());
+    }
+    let mut sorted = alphas.clone();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let mean = alphas.iter().sum::<f64>() / alphas.len() as f64;
+    println!(
+        "\nα médian {median:.2}, moyen {mean:.2}, étendue {:.2}–{:.2} sur {} observations",
+        sorted[0],
+        sorted[sorted.len() - 1],
+        alphas.len()
+    );
+    let off = alphas
+        .iter()
+        .filter(|a| **a > m.alpha * m.window || **a < m.alpha / m.window)
+        .count();
+    if off > 0 {
+        println!(
+            "{off} observation(s) hors de la fenêtre ×÷{:.2} autour de α={:.2}",
+            m.window, m.alpha
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sim(
+    data: &Path,
+    n: usize,
+    seed: u64,
+    prior: usize,
+    opts: &GameOpts,
+    sim_alpha: Option<f64>,
+    jitter: f64,
+    verbose: bool,
+) -> Result<()> {
+    let scoring = opts.scoring()?;
     let model = model::load(data)?;
     let pool: Vec<u32> = model
         .plausible_indices()
         .into_iter()
         .filter(|&i| (i as usize) < prior)
         .collect();
-    println!(
-        "{} parties ({game}, scores arrondis à 1/{scale}), secrets tirés parmi {} mots (rang < {prior})",
-        n,
-        pool.len()
-    );
+    match scoring {
+        Scoring::Cosine { scale } => println!(
+            "{n} parties ({}, scores arrondis à 1/{scale}), secrets tirés parmi {} mots (rang < {prior})",
+            opts.game,
+            pool.len()
+        ),
+        Scoring::Rank(m) => println!(
+            "{n} parties ({}, score = {:.0} − rang, plancher {:.0}), solver α={:.2} fenêtre ×÷{:.2}, \
+             site simulé α={:.2} bruit ±{:.0} %, secrets tirés parmi {} mots (rang < {prior})",
+            opts.game,
+            m.top,
+            m.floor,
+            m.alpha,
+            m.window,
+            sim_alpha.unwrap_or(m.alpha),
+            jitter * 100.0,
+            pool.len()
+        ),
+    }
     let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     let mut hist = vec![0usize; 64];
     let mut total_ms = 0u64;
@@ -187,13 +371,16 @@ fn sim(data: &Path, n: usize, seed: u64, prior: usize, game: &str, verbose: bool
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let secret = pool[((rng >> 33) as usize) % pool.len()];
-        let mut oracle = LocalOracle::new(&model, secret, scale);
+        let mut oracle = LocalOracle::with_lexicon(&model, secret, scoring, jitter, seed);
+        if let Some(a) = sim_alpha {
+            oracle.set_alpha(a);
+        }
         let mut emit = |ev: &Event| {
             if verbose {
                 print_event(ev);
             }
         };
-        let res = play_game(&model, &mut oracle, scale, &[], &mut emit)?;
+        let res = play_game(&model, &mut oracle, scoring, &[], &mut emit)?;
         hist[(res.guesses as usize).min(63)] += 1;
         total_ms += res.total_ms;
         if res.guesses >= 6 {
@@ -237,6 +424,7 @@ fn sim(data: &Path, n: usize, seed: u64, prior: usize, game: &str, verbose: bool
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn play(
     data: &Path,
     day: Option<u32>,
@@ -244,7 +432,9 @@ fn play(
     start: Vec<String>,
     choose: bool,
     delay: u64,
+    opts: &GameOpts,
 ) -> Result<()> {
+    let scoring = opts.scoring()?;
     let model = model::load(data)?;
     let mut forced: Vec<u32> = Vec::new();
     for w in &start {
@@ -263,10 +453,17 @@ fn play(
             (
                 None,
                 format!("hors ligne · secret « {w} »"),
-                Box::new(LocalOracle::new(&model, idx, SCALE_CEMANTIX)),
+                Box::new(LocalOracle::new(&model, idx, scoring)),
             )
         }
         None => {
+            if scoring.is_rank() {
+                bail!(
+                    "l'API de {} exige un jeton d'authentification : jouez via la page web, \
+                     ou hors ligne avec --dry-run <mot>",
+                    opts.game
+                );
+            }
             let d = match day {
                 Some(d) => d,
                 None => api::fetch_home()?.day,
@@ -283,12 +480,18 @@ fn play(
         }
     };
 
+    let opener = if scoring.is_rank() {
+        model.rank_opener
+    } else {
+        model.opener
+    };
     print_event(&Event::Init {
         day,
         mode,
+        game: opts.game.clone(),
         model: model.name.clone(),
         plausible: model.plausible.iter().filter(|&&p| p).count(),
-        opener: model.opener.map(|i| model.words[i as usize].clone()),
+        opener: opener.map(|i| model.words[i as usize].clone()),
     });
 
     if choose {
@@ -320,5 +523,5 @@ fn play(
     }
 
     let mut emit = |ev: &Event| print_event(ev);
-    play_game(&model, oracle.as_mut(), SCALE_CEMANTIX, &forced, &mut emit).map(|_| ())
+    play_game(&model, oracle.as_mut(), scoring, &forced, &mut emit).map(|_| ())
 }
